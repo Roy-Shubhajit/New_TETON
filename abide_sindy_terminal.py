@@ -110,6 +110,18 @@ def _safe_filename(text: str) -> str:
     return "".join(cleaned).strip("._") or "sample"
 
 
+def _get_rois_attribute(derivatives: str) -> str:
+    """Convert derivatives argument to the corresponding ROI attribute name."""
+    # Map common derivatives to their attribute names
+    attr_map = {
+        "rois_ho": "rois_ho",
+        "rois_cc200": "rois_cc200",
+        "rois_cc400": "rois_cc400",
+        "rois_aal": "rois_aal",
+    }
+    return attr_map.get(derivatives, derivatives)
+
+
 def _sample_label(abide: Any, index: int) -> str:
     for attr_name in ("subject_id", "subject_ids", "subjects", "site_id", "ids"):
         values = getattr(abide, attr_name, None)
@@ -270,9 +282,11 @@ def main() -> None:
         print("[done] Download completed (download-only mode).")
         return
 
-    if not getattr(abide, "rois_ho", None):
+    rois_attr = _get_rois_attribute(cli.derivatives)
+    rois_data = getattr(abide, rois_attr, None)
+    if not rois_data:
         raise RuntimeError(
-            "No ROI time series found in downloaded ABIDE data. "
+            f"No ROI time series found for derivative '{cli.derivatives}' in downloaded ABIDE data. "
             "Try a different derivative or number of subjects."
         )
 
@@ -280,10 +294,10 @@ def main() -> None:
     processed_dir.mkdir(parents=True, exist_ok=True)
 
     sample_payloads: list[dict[str, Any]] = []
-    for sample_index, ts_data in enumerate(abide.rois_ho):
+    for sample_index, ts_data in enumerate(rois_data):
         sample_label = _sample_label(abide, sample_index)
         print("\n" + "=" * 80)
-        print(f"[sample] {sample_index + 1}/{len(abide.rois_ho)}: {sample_label}")
+        print(f"[sample] {sample_index + 1}/{len(rois_data)}: {sample_label}")
         print(f"Time series shape (Timepoints, ROIs): {ts_data.shape}")
 
         summarize_timeseries(ts_data)
