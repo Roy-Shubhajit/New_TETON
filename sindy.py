@@ -19,13 +19,14 @@ except ImportError:
 xp = cp if GPU_AVAILABLE else np
 
 class SindyArgs:
-    def __init__(self, win_len=5120, stride=5120, d_max=2, simpl_rho=1.0, scale=1.0,
+    def __init__(self, win_len=5120, stride=None, overlap=0.5, d_max=2, simpl_rho=1.0, scale=1.0,
                  admm_rho=3.0, admm_overrelax=1.6, max_iters=500, fs=256.0,
                  win_sg=29, order=3, r_target_pc=0.95, k_min=600, k_max=1000000,
                  row_norm_nnz_thr=1e-6, param_abs_nnz_thr=1e-8,
                  tau2_q=0.75, tau3_q=0.75):
         self.win_len = win_len
         self.stride = stride
+        self.overlap = overlap
         self.d_max = d_max
         self.simpl_rho = simpl_rho
         self.scale = scale
@@ -161,6 +162,84 @@ def degree_weights(maps, g, pair_lambda_mult=1.5):
     for (_,_), r in maps.get(2, {}).items():
         w[r] *= xp.array(pair_lambda_mult, dtype=xp.float32)
     return w
+
+def _window_stride_from_args(args):
+    stride = args.stride
+    if stride is None:
+        stride = int(round(args.win_len * (1.0 - float(getattr(args, "overlap", 0.0)))))
+    return max(1, min(int(stride), int(args.win_len)))
+
+def build_edge_triangle_incidence(n_nodes, edges, triangles):
+    edge_list = [tuple(sorted(edge)) for edge in edges]
+    triangle_list = [tuple(sorted(tri)) for tri in triangles]
+
+    edge_index = {edge: idx for idx, edge in enumerate(edge_list)}
+
+    edge_incidence = np.zeros((n_nodes, len(edge_list)), dtype=np.int8)
+    for e_idx, (i, j) in enumerate(edge_list):
+        edge_incidence[i, e_idx] = 1
+        edge_incidence[j, e_idx] = 1
+
+    triangle_node_incidence = np.zeros((n_nodes, len(triangle_list)), dtype=np.int8)
+    triangle_edge_incidence = np.zeros((len(edge_list), len(triangle_list)), dtype=np.int8)
+    for t_idx, tri in enumerate(triangle_list):
+        for node in tri:
+            triangle_node_incidence[node, t_idx] = 1
+        for edge in combinations(tri, 2):
+            edge_key = tuple(sorted(edge))
+            e_idx = edge_index.get(edge_key)
+            if e_idx is not None:
+                triangle_edge_incidence[e_idx, t_idx] = 1
+
+    return {
+        "edge_list": edge_list,
+        "triangle_list": triangle_list,
+        "edge_incidence": edge_incidence,
+        "triangle_node_incidence": triangle_node_incidence,
+        "triangle_edge_incidence": triangle_edge_incidence,
+    }
+
+def _window_result_payload(scores, res, n_nodes, w_start, w_end, window_index):
+    node_scores = np.asarray(scores.get("S1", np.zeros(n_nodes)), dtype=float)
+    edge_adjacency = np.asarray(scores.get("S2", np.zeros((n_nodes, n_nodes))), dtype=float)
+    triangle_scores = scores.get("S3_max", {})
+
+    topology = build_edge_triangle_incidence(n_nodes, res["edges"], res["triangles"])
+
+    edge_feature_values = [float(edge_adjacency[i, j]) for i, j in topology["edge_list"]]
+    triangle_feature_values = [float(triangle_scores.get(frozenset(tri), 0.0)) for tri in topology["triangle_list"]]
+
+    return {
+        "window_index": int(window_index),
+        "window_start": int(w_start),
+        "window_end": int(w_end),
+        "window_length": int(w_end - w_start),
+        "nodes": list(range(n_nodes)),
+        "node_features": {
+            "vector": node_scores,
+            "adjacency": np.diag(node_scores),
+        },
+        "edges": topology["edge_list"],
+        "edge_features": {
+            "vector": edge_feature_values,
+            "adjacency": edge_adjacency,
+            "incidence": topology["edge_incidence"],
+        },
+        "triangles": topology["triangle_list"],
+        "triangle_features": {
+            "vector": triangle_feature_values,
+            "incidence_nodes": topology["triangle_node_incidence"],
+            "incidence_edges": topology["triangle_edge_incidence"],
+        },
+        "closed_triangles": [tuple(sorted(tri)) for tri in res["closed_triangles"]],
+        "violating_triangles": [tuple(sorted(tri)) for tri in res["violating_triangles"]],
+        "tau2": float(res["tau2"]),
+        "tau3": float(res["tau3"]),
+        "n_edges": int(res["n_edges"]),
+        "n_triangles": int(res["n_triangles"]),
+        "n_closed_triangles": int(res["n_closed_triangles"]),
+        "n_violating_triangles": int(res["n_violating_triangles"]),
+    }
 
 def kkt_grad_row_norms(G, B, Xi):
     R = G @ Xi - B
@@ -305,12 +384,15 @@ def readout_scores_multi_mode(Xi, n, dmax, maps):
     out = {}
 
     if dmax >= 1 and maps[1]:
+        S1 = np.zeros(n)
         S2_dir = np.zeros((n, n))
         for j in range(n):
             row = maps[1][(j,)]
+            S1[j] = float(np.linalg.norm(absA[row]))
             for i in range(n):
                 if i == j: continue
                 S2_dir[i, j] = absA[row, i]
+        out['S1'] = S1
         out['S2'] = np.maximum(S2_dir, S2_dir.T)
 
     if dmax >= 2 and maps[2]:
@@ -420,11 +502,17 @@ def process_data_in_windows(data, args):
     w_degree_base = degree_weights(maps0, g_total)
 
     T_len = X_full.shape[1]
+    stride = _window_stride_from_args(args)
+
+    if T_len < args.win_len:
+        raise ValueError(
+            f"Input length {T_len} is shorter than the fixed window length {args.win_len}."
+        )
     
     results = []
 
     # Iterate continuously over sliding windows
-    for w_start in range(0, T_len - args.win_len + 1, args.stride):
+    for window_index, w_start in enumerate(range(0, T_len - args.win_len + 1, stride)):
         w_end = w_start + args.win_len
         
         # 1. WINDOW DEPENDENT SLICING
@@ -620,16 +708,14 @@ def process_data_in_windows(data, args):
             S3_key="S3_max"
         )
         
-        window_result = {
-            "window_start": w_start,
-            "window_end": w_end,
-            "edges": list(res["edges"]),
-            "triangles": list(res["triangles"]),
-            "closed_triangles": list(res["closed_triangles"]),
-            "violating_triangles": list(res["violating_triangles"]),
-            "tau2": res["tau2"],
-            "tau3": res["tau3"]
-        }
+        window_result = _window_result_payload(
+            scores=scores,
+            res=res,
+            n_nodes=n,
+            w_start=w_start,
+            w_end=w_end,
+            window_index=window_index,
+        )
         results.append(window_result)
         
     return results

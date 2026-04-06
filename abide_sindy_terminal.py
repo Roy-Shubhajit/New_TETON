@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import tarfile
 import time
 from pathlib import Path
 from typing import Any
@@ -88,45 +89,51 @@ def save_roi_plot(ts_data: np.ndarray, output_path: Path) -> None:
     print(f"[output] Saved ROI plot to: {output_path}")
 
 
-def to_serializable_result(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Convert SINDy output with sets/frozensets to JSON-friendly data."""
-    serializable: list[dict[str, Any]] = []
-    for res in results:
-        row: dict[str, Any] = {
-            "window_start": int(res.get("window_start", 0)),
-            "window_end": int(res.get("window_end", 0)),
-            "tau2": float(res.get("tau2", 0.0)),
-            "tau3": float(res.get("tau3", 0.0)),
-            "num_edges": int(len(res.get("edges", []))),
-            "num_triangles": int(len(res.get("triangles", []))),
-            "num_closed_triangles": int(len(res.get("closed_triangles", []))),
-            "num_violating_triangles": int(len(res.get("violating_triangles", []))),
-        }
-
-        edges = sorted(sorted(list(edge)) for edge in res.get("edges", []))
-        triangles = sorted(sorted(list(tri)) for tri in res.get("triangles", []))
-        row["edges"] = edges
-        row["triangles"] = triangles
-        serializable.append(row)
-    return serializable
+def _to_jsonable(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.integer, np.floating)):
+        return value.item()
+    if isinstance(value, frozenset):
+        return sorted(list(value))
+    if isinstance(value, set):
+        return sorted(list(value))
+    if isinstance(value, dict):
+        return {str(key): _to_jsonable(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(item) for item in value]
+    return value
 
 
-def run_sindy(ts_data: np.ndarray, num_windows: int, max_rois: int) -> list[dict[str, Any]]:
+def _safe_filename(text: str) -> str:
+    cleaned = [ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in text]
+    return "".join(cleaned).strip("._") or "sample"
+
+
+def _sample_label(abide: Any, index: int) -> str:
+    for attr_name in ("subject_id", "subject_ids", "subjects", "site_id", "ids"):
+        values = getattr(abide, attr_name, None)
+        if values is None:
+            continue
+        try:
+            value = values[index]
+        except Exception:  # noqa: BLE001 - dataset objects vary across nilearn versions
+            continue
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="ignore")
+        return str(value)
+    return f"sample_{index:04d}"
+
+
+def run_sindy(ts_data: np.ndarray, window_len: int, overlap: float, max_rois: int) -> dict[str, Any]:
     data_raw = ts_data.T
     data_raw = data_raw[:max_rois, :]
     print(f"Data shape for SINDy [Nodes, Timepoints]: {data_raw.shape}")
 
-    win_sg = 29
-    trim = win_sg - 1
-    win_len = (data_raw.shape[1] - trim) // num_windows
-    if win_len <= 0:
-        raise ValueError(
-            "Window length computed as <= 0. Reduce num_windows or use more timepoints."
-        )
-
     args = SindyArgs(
-        win_len=win_len,
-        stride=win_len,
+        win_len=window_len,
+        stride=None,
+        overlap=overlap,
         d_max=2,
         simpl_rho=1.0,
         scale=1.0,
@@ -134,13 +141,14 @@ def run_sindy(ts_data: np.ndarray, num_windows: int, max_rois: int) -> list[dict
         tau3_q=0.50,
     )
 
-    print(f"Data will be split into {num_windows} windows of length {win_len}.")
+    stride = max(1, int(round(window_len * (1.0 - overlap))))
+    print(f"Data will be split into overlapping windows of length {window_len} and stride {stride}.")
     print("Starting processing over windows...")
     results = process_data_in_windows(data_raw, args)
     print(f"Processed {len(results)} windows.")
 
-    all_edges = [set(res["edges"]) for res in results]
-    all_tris = [set(res["triangles"]) for res in results]
+    all_edges = [set(tuple(edge) for edge in res["edges"]) for res in results]
+    all_tris = [set(tuple(tri) for tri in res["triangles"]) for res in results]
 
     print("\n" + "=" * 50)
     print("TEMPORAL CHANGES SUMMARY")
@@ -158,7 +166,12 @@ def run_sindy(ts_data: np.ndarray, num_windows: int, max_rois: int) -> list[dict
         print(f"  Tris Added    (+{len(new_tris)}): {list(new_tris)}")
         print(f"  Tris Dropped  (-{len(dropped_tris)}): {list(dropped_tris)}")
 
-    return results
+    return {
+        "window_len": window_len,
+        "stride": stride,
+        "num_windows": len(results),
+        "windows": results,
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -204,10 +217,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only download dataset and exit without SINDy processing.",
     )
     parser.add_argument(
-        "--num-windows",
+        "--window-len",
         type=int,
-        default=4,
-        help="Number of SINDy windows (default: 4).",
+        default=50,
+        help="Fixed window length in timepoints (default: 50).",
+    )
+    parser.add_argument(
+        "--window-overlap",
+        type=float,
+        default=0.5,
+        help="Fractional overlap between consecutive windows, in [0, 1). Default: 0.5.",
     )
     parser.add_argument(
         "--max-rois",
@@ -234,6 +253,11 @@ def main() -> None:
     print(f"[config] n_subjects: {'all' if n_subjects is None else n_subjects}")
     print(f"[config] derivatives: {cli.derivatives}")
 
+    if cli.window_len <= 0:
+        raise ValueError("--window-len must be a positive integer.")
+    if not (0.0 <= cli.window_overlap < 1.0):
+        raise ValueError("--window-overlap must be in the range [0, 1).")
+
     abide = fetch_abide_with_retries(
         data_dir=download_dir,
         n_subjects=n_subjects,
@@ -252,19 +276,74 @@ def main() -> None:
             "Try a different derivative or number of subjects."
         )
 
-    ts_data = abide.rois_ho[0]
-    print(f"Time series shape (Timepoints, ROIs): {ts_data.shape}")
+    processed_dir = download_dir / "abide_sindy_processed"
+    processed_dir.mkdir(parents=True, exist_ok=True)
 
-    summarize_timeseries(ts_data)
-    save_roi_plot(ts_data, download_dir / "abide_roi_preview.png")
+    sample_payloads: list[dict[str, Any]] = []
+    for sample_index, ts_data in enumerate(abide.rois_ho):
+        sample_label = _sample_label(abide, sample_index)
+        print("\n" + "=" * 80)
+        print(f"[sample] {sample_index + 1}/{len(abide.rois_ho)}: {sample_label}")
+        print(f"Time series shape (Timepoints, ROIs): {ts_data.shape}")
 
-    results = run_sindy(ts_data, num_windows=cli.num_windows, max_rois=cli.max_rois)
+        summarize_timeseries(ts_data)
+        if sample_index == 0:
+            save_roi_plot(ts_data, download_dir / "abide_roi_preview.png")
 
-    serializable_results = to_serializable_result(results)
-    results_path = download_dir / "abide_sindy_results.json"
-    with results_path.open("w", encoding="utf-8") as fp:
-        json.dump(serializable_results, fp, indent=2)
-    print(f"[output] Saved SINDy results to: {results_path}")
+        try:
+            sample_result = run_sindy(
+                ts_data,
+                window_len=cli.window_len,
+                overlap=cli.window_overlap,
+                max_rois=cli.max_rois,
+            )
+        except ValueError as exc:
+            print(f"[skip] {sample_label}: {exc}")
+            continue
+
+        sample_payload = {
+            "sample_index": sample_index,
+            "sample_id": sample_label,
+            "timepoints": int(ts_data.shape[0]),
+            "rois": int(ts_data.shape[1]),
+            **sample_result,
+        }
+        sample_payloads.append(sample_payload)
+
+        sample_path = processed_dir / f"{sample_index:04d}_{_safe_filename(sample_label)}.json"
+        with sample_path.open("w", encoding="utf-8") as fp:
+            json.dump(_to_jsonable(sample_payload), fp, indent=2)
+        print(f"[output] Saved sample result to: {sample_path}")
+
+    manifest = {
+        "download_dir": str(download_dir),
+        "n_subjects": "all" if n_subjects is None else n_subjects,
+        "derivatives": cli.derivatives,
+        "window_len": cli.window_len,
+        "window_overlap": cli.window_overlap,
+        "max_rois": cli.max_rois,
+        "num_samples_processed": len(sample_payloads),
+        "samples": [
+            {
+                "sample_index": payload["sample_index"],
+                "sample_id": payload["sample_id"],
+                "num_windows": payload["num_windows"],
+                "window_len": payload["window_len"],
+                "stride": payload["stride"],
+            }
+            for payload in sample_payloads
+        ],
+    }
+
+    manifest_path = processed_dir / "manifest.json"
+    with manifest_path.open("w", encoding="utf-8") as fp:
+        json.dump(_to_jsonable(manifest), fp, indent=2)
+    print(f"[output] Saved manifest to: {manifest_path}")
+
+    archive_path = download_dir / "abide_sindy_processed.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as tar:
+        tar.add(processed_dir, arcname="abide_sindy_processed")
+    print(f"[output] Saved tar archive to: {archive_path}")
 
     print("[done] ABIDE + SINDy pipeline completed.")
 
