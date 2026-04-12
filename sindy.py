@@ -1,7 +1,7 @@
 import os
 import math
 from itertools import combinations
-
+from tqdm import tqdm
 import numpy as np
 import pandas as pd
 from scipy.signal import savgol_filter
@@ -20,7 +20,7 @@ xp = cp if GPU_AVAILABLE else np
 
 class SindyArgs:
     def __init__(self, win_len=5120, stride=None, overlap=0.5, d_max=2, simpl_rho=1.0, scale=1.0,
-                 admm_rho=3.0, admm_overrelax=1.6, max_iters=500, fs=256.0,
+                 admm_rho=3.0, admm_overrelax=1.6, max_iters=100, fs=256.0,
                  win_sg=29, order=3, r_target_pc=0.95, k_min=600, k_max=1000000,
                  row_norm_nnz_thr=1e-6, param_abs_nnz_thr=1e-8,
                  tau2_q=0.75, tau3_q=0.75):
@@ -276,7 +276,7 @@ def solve_admm_gl_soc(
 
     lam = lamb
 
-    for it in range(max_iters):
+    for it in tqdm(range(max_iters)):
         Z_prev = Z.copy()
         C_prev = C.copy()
 
@@ -325,6 +325,9 @@ def solve_admm_gl_soc(
 
         if r_pri < 1e-3 and r_dual < 1e-3:
             break
+
+    if it == (max_iters - 1):
+        print(f"⚠️ ADMM did not converge after {max_iters} iterations (r_pri={r_pri:.2e}, r_dual={r_dual:.2e})")
 
     if return_trace: return Xi, C, {}
     else: return Xi, C

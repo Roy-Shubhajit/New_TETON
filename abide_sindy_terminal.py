@@ -137,9 +137,9 @@ def _sample_label(abide: Any, index: int) -> str:
     return f"sample_{index:04d}"
 
 
-def run_sindy(ts_data: np.ndarray, window_len: int, overlap: float, max_rois: int) -> dict[str, Any]:
+def run_sindy(ts_data: np.ndarray, window_len: int, overlap: float) -> dict[str, Any]:
     data_raw = ts_data.T
-    data_raw = data_raw[:max_rois, :]
+    #data_raw = data_raw[:max_rois, :]
     print(f"Data shape for SINDy [Nodes, Timepoints]: {data_raw.shape}")
 
     args = SindyArgs(
