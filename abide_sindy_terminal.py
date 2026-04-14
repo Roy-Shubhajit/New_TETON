@@ -18,8 +18,29 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 from nilearn import datasets
+from scipy.interpolate import CubicSpline
 
 from sindy import SindyArgs, process_data_in_windows
+
+
+def cubic_spline_upsample_timeseries(subject_ts: np.ndarray, factor: int) -> np.ndarray:
+    """Upsample one subject time series shaped [timepoints, rois]."""
+    if factor < 1:
+        raise ValueError("factor must be >= 1")
+
+    num_timepoints, num_rois = subject_ts.shape
+    if factor == 1:
+        return subject_ts.copy()
+
+    x_old = np.arange(num_timepoints, dtype=float)
+    num_timepoints_new = num_timepoints * factor
+    x_new = np.linspace(0.0, float(num_timepoints - 1), num_timepoints_new)
+
+    upsampled = np.empty((num_timepoints_new, num_rois), dtype=float)
+    for roi_idx in range(num_rois):
+        spline = CubicSpline(x_old, subject_ts[:, roi_idx], bc_type="natural")
+        upsampled[:, roi_idx] = spline(x_new)
+    return upsampled
 
 
 def parse_n_subjects(raw_value: str) -> int | None:
@@ -137,7 +158,7 @@ def _sample_label(abide: Any, index: int) -> str:
     return f"sample_{index:04d}"
 
 
-def run_sindy(ts_data: np.ndarray, window_len: int, overlap: float) -> dict[str, Any]:
+def run_sindy(ts_data: np.ndarray, window_len: int, overlap: float, fs: float) -> dict[str, Any]:
     data_raw = ts_data.T
     #data_raw = data_raw[:max_rois, :]
     print(f"Data shape for SINDy [Nodes, Timepoints]: {data_raw.shape}")
@@ -151,6 +172,7 @@ def run_sindy(ts_data: np.ndarray, window_len: int, overlap: float) -> dict[str,
         scale=1.0,
         tau2_q=0.50,
         tau3_q=0.50,
+        fs=fs
     )
 
     stride = max(1, int(round(window_len * (1.0 - overlap))))
@@ -301,15 +323,17 @@ def main() -> None:
         print(f"Time series shape (Timepoints, ROIs): {ts_data.shape}")
 
         summarize_timeseries(ts_data)
-        if sample_index == 0:
-            save_roi_plot(ts_data, download_dir / "abide_roi_preview.png")
+        ts_data_interp = cubic_spline_upsample_timeseries(ts_data, 100)
+        #if sample_index == 0:
+            #save_roi_plot(ts_data, download_dir / "abide_roi_preview.png")
 
         try:
             sample_result = run_sindy(
-                ts_data,
+                ts_data_interp,
                 window_len=cli.window_len,
                 overlap=cli.window_overlap,
                 max_rois=cli.max_rois,
+                fs=0.5*100
             )
         except ValueError as exc:
             print(f"[skip] {sample_label}: {exc}")
@@ -318,8 +342,8 @@ def main() -> None:
         sample_payload = {
             "sample_index": sample_index,
             "sample_id": sample_label,
-            "timepoints": int(ts_data.shape[0]),
-            "rois": int(ts_data.shape[1]),
+            "timepoints": int(ts_data_interp.shape[0]),
+            "rois": int(ts_data_interp.shape[1]),
             **sample_result,
         }
         sample_payloads.append(sample_payload)

@@ -27,12 +27,25 @@ try:
     import cupy as cp  # type: ignore
 
     GPU_AVAILABLE = True
-    _ = cp.zeros(1)
+    # Probe a tiny kernel execution so driver/runtime incompatibility is caught early.
+    _probe = cp.ones((4,), dtype=cp.float32)
+    _probe_sum = float(cp.sum(_probe).item())
+    if not np.isfinite(_probe_sum):
+        raise RuntimeError("CuPy probe produced a non-finite value")
+    print("CuPy runtime probe passed. GPU acceleration enabled.")
 except Exception:
     cp = np  # fallback alias so type checks pass in function bodies
     GPU_AVAILABLE = False
+    print("CuPy is unavailable or unusable. Falling back to CPU.")
 
-xp = cp if GPU_AVAILABLE else np
+# Force CPU mode override (set by notebook if FORCE_CPU_MODE=True)
+FORCE_CPU_OVERRIDE = False
+
+# Final decision: use GPU only if available AND not forced to CPU
+if FORCE_CPU_OVERRIDE or not GPU_AVAILABLE:
+    xp = np
+else:
+    xp = cp
 
 
 @dataclass
@@ -88,7 +101,11 @@ class WindowResult:
 
 
 def to_numpy(x):
-    return cp.asnumpy(x) if GPU_AVAILABLE else x
+    # If xp is cp (GPU mode), convert from GPU array. Otherwise return as-is.
+    if xp is cp:
+        return cp.asnumpy(x)
+    else:
+        return x
 
 
 def _validate_input_matrix(X: np.ndarray) -> np.ndarray:
@@ -374,6 +391,8 @@ def solve_window(
     thr_cfg: ThresholdConfig,
 ) -> WindowResult:
     """Run full graph-only dmax=1 SINDy for a single [start, end) window."""
+    global GPU_AVAILABLE, xp
+
     n = X_proc.shape[0]
 
     Xw = X_proc[:, start:end]
@@ -393,93 +412,103 @@ def solve_window(
     if Xw_use.shape[1] < 5:
         raise ValueError(f"Window {window_id}: too few usable samples after selection")
 
-    if GPU_AVAILABLE:
-        XT = cp.asarray(Xw_use.T)
-        YT = cp.asarray(Yw_use.T)
-    else:
-        XT = Xw_use.T
-        YT = Yw_use.T
+    try:
+        # Use xp (which may be numpy if FORCE_CPU_OVERRIDE is set)
+        XT = xp.asarray(Xw_use.T)
+        YT = xp.asarray(Yw_use.T)
 
-    Theta = build_library_linear(XT)
+        Theta = build_library_linear(XT)
 
-    Theta_mean = xp.mean(Theta, axis=0, keepdims=True)
-    Theta_stdv = xp.std(Theta, axis=0, keepdims=True) + 1e-8
-    Thetaz = (Theta - Theta_mean) / Theta_stdv
+        Theta_mean = xp.mean(Theta, axis=0, keepdims=True)
+        Theta_stdv = xp.std(Theta, axis=0, keepdims=True) + 1e-8
+        Thetaz = (Theta - Theta_mean) / Theta_stdv
 
-    Y_mean = xp.mean(YT, axis=0, keepdims=True)
-    Y_stdv = xp.std(YT, axis=0, keepdims=True) + 1e-8
-    Y_scaled = (YT - Y_mean) / Y_stdv
+        Y_mean = xp.mean(YT, axis=0, keepdims=True)
+        Y_stdv = xp.std(YT, axis=0, keepdims=True) + 1e-8
+        Y_scaled = (YT - Y_mean) / Y_stdv
 
-    Thetaz = Thetaz.astype(xp.float32, copy=False)
-    Y_scaled = Y_scaled.astype(xp.float32, copy=False)
+        Thetaz = Thetaz.astype(xp.float32, copy=False)
+        Y_scaled = Y_scaled.astype(xp.float32, copy=False)
 
-    G, B = precompute_gram(Thetaz, Y_scaled)
+        G, B = precompute_gram(Thetaz, Y_scaled)
 
-    T_eff = Thetaz.shape[0]
-    G_eff = Thetaz.shape[1]
+        T_eff = Thetaz.shape[0]
+        G_eff = Thetaz.shape[1]
 
-    med = xp.median(Y_scaled, axis=0, keepdims=True)
-    mad = xp.median(xp.abs(Y_scaled - med), axis=0, keepdims=True)
-    res_std = float(1.4826 * xp.mean(mad))
+        med = xp.median(Y_scaled, axis=0, keepdims=True)
+        mad = xp.median(xp.abs(Y_scaled - med), axis=0, keepdims=True)
+        res_std = float(1.4826 * xp.mean(mad))
 
-    base_thr = (res_std / max(1, math.sqrt(T_eff))) * math.sqrt(2.0 * math.log(max(2, G_eff)))
+        base_thr = (res_std / max(1, math.sqrt(T_eff))) * math.sqrt(2.0 * math.log(max(2, G_eff)))
 
-    def fit_for_scale(scale: float):
-        thr_loc = float(scale * base_thr)
-        Xi_loc = solve_stlsq(
-            G,
-            B,
-            lam_ridge=solver_cfg.ridge_lambda,
-            thr=thr_loc,
-            n_iter=solver_cfg.stlsq_iters,
-            keep_const=True,
+        def fit_for_scale(scale: float):
+            thr_loc = float(scale * base_thr)
+            Xi_loc = solve_stlsq(
+                G,
+                B,
+                lam_ridge=solver_cfg.ridge_lambda,
+                thr=thr_loc,
+                n_iter=solver_cfg.stlsq_iters,
+                keep_const=True,
+            )
+            Xi_loc = refit_on_support(
+                G,
+                B,
+                Xi_loc,
+                lam_ridge=solver_cfg.refit_lambda,
+                keep_const=True,
+            )
+            nnz_rows_loc, nnz_params_loc = nnz_summary(Xi_loc)
+            return Xi_loc, thr_loc, nnz_rows_loc, nnz_params_loc
+
+        scale_used = float(solver_cfg.lambda_scale)
+        Xi, thr, nnz_rows, nnz_params = fit_for_scale(scale_used)
+
+        if solver_cfg.auto_relax_if_empty and nnz_params == 0:
+            for factor in solver_cfg.relax_scale_factors:
+                scale_try = float(solver_cfg.lambda_scale * factor)
+                Xi_try, thr_try, nnz_rows_try, nnz_params_try = fit_for_scale(scale_try)
+                if nnz_params_try > 0:
+                    Xi, thr, nnz_rows, nnz_params = Xi_try, thr_try, nnz_rows_try, nnz_params_try
+                    scale_used = scale_try
+                    break
+
+        S2, S2_dir = readout_graph_scores_avg(Xi, n)
+        tau2 = choose_edge_threshold(S2, thr_cfg.edge_quantile)
+        pred_edges, edge_scores, pred_tris, tri_scores = build_clique_complex_from_graph(S2, tau2)
+
+        return WindowResult(
+            window_id=window_id,
+            start=start,
+            end=end,
+            n_samples_used=int(Xw_use.shape[1]),
+            lambda_scale_used=scale_used,
+            thr_stlsq=float(thr),
+            tau2=float(tau2),
+            n_edges=int(len(pred_edges)),
+            n_triangles=int(len(pred_tris)),
+            nnz_rows=int(nnz_rows),
+            nnz_params=int(nnz_params),
+            edge_scores=edge_scores,
+            tri_scores=tri_scores,
+            pred_edges=pred_edges,
+            pred_tris=pred_tris,
+            Xi=to_numpy(Xi),
+            S2=S2,
+            S2_dir=S2_dir,
         )
-        Xi_loc = refit_on_support(
-            G,
-            B,
-            Xi_loc,
-            lam_ridge=solver_cfg.refit_lambda,
-            keep_const=True,
-        )
-        nnz_rows_loc, nnz_params_loc = nnz_summary(Xi_loc)
-        return Xi_loc, thr_loc, nnz_rows_loc, nnz_params_loc
-
-    scale_used = float(solver_cfg.lambda_scale)
-    Xi, thr, nnz_rows, nnz_params = fit_for_scale(scale_used)
-
-    if solver_cfg.auto_relax_if_empty and nnz_params == 0:
-        for factor in solver_cfg.relax_scale_factors:
-            scale_try = float(solver_cfg.lambda_scale * factor)
-            Xi_try, thr_try, nnz_rows_try, nnz_params_try = fit_for_scale(scale_try)
-            if nnz_params_try > 0:
-                Xi, thr, nnz_rows, nnz_params = Xi_try, thr_try, nnz_rows_try, nnz_params_try
-                scale_used = scale_try
-                break
-
-    S2, S2_dir = readout_graph_scores_avg(Xi, n)
-    tau2 = choose_edge_threshold(S2, thr_cfg.edge_quantile)
-    pred_edges, edge_scores, pred_tris, tri_scores = build_clique_complex_from_graph(S2, tau2)
-
-    return WindowResult(
-        window_id=window_id,
-        start=start,
-        end=end,
-        n_samples_used=int(Xw_use.shape[1]),
-        lambda_scale_used=float(scale_used),
-        thr_stlsq=float(thr),
-        tau2=float(tau2),
-        n_edges=len(pred_edges),
-        n_triangles=len(pred_tris),
-        nnz_rows=nnz_rows,
-        nnz_params=nnz_params,
-        edge_scores=edge_scores,
-        tri_scores=tri_scores,
-        pred_edges=pred_edges,
-        pred_tris=pred_tris,
-        Xi=to_numpy(Xi),
-        S2=S2,
-        S2_dir=S2_dir,
-    )
+    except Exception as e:
+        if GPU_AVAILABLE:
+            err_txt = str(e).upper()
+            if "CUDA" in err_txt or "CUPY" in type(e).__module__.lower():
+                print(
+                    f"Window {window_id}: GPU runtime failure ({type(e).__name__}). "
+                    "Switching to CPU for this and remaining windows."
+                )
+                GPU_AVAILABLE = False
+                xp = np
+                return solve_window(X_proc, Y_proc, start, end, window_id, sel_cfg, solver_cfg, thr_cfg)
+        raise
 
 
 def run_sindy_windows(

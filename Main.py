@@ -90,7 +90,6 @@ class ModelTrainer:
             factor=0.5,
             patience=5,
             min_lr=1e-7,
-            verbose=True,
         )
         
         # Tracking
@@ -406,7 +405,7 @@ def main():
     parser.add_argument(
         "--gpu",
         action="store_true",
-        help="Use GPU if available"
+        help="Deprecated flag; ML pipeline now uses GPU automatically when available"
     )
     parser.add_argument(
         "--seed",
@@ -456,8 +455,8 @@ def main():
     logger.info("ABIDE SINDy ML Pipeline")
     logger.info("="*60)
     
-    # Setup device
-    device = torch.device("cuda" if args.gpu and torch.cuda.is_available() else "cpu")
+    # Setup device for ML pipeline (prefer GPU when available).
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
     
     # Set random seeds
@@ -477,7 +476,7 @@ def main():
             data_dir="/hdfs1/Data/Shubhajit/Project/New_TETON",
             n_subjects=config.get("dataset.n_subjects"),
             window_length=window_length,
-            window_overlap=config.get("processing.window_overlap", 0.5),
+            window_overlap=config.get("processing.window_overlap", 0.25),
             batch_size=config.get("training.batch_size", 32),
             train_split=config.get("training.train_split", 0.7),
             val_split=config.get("training.val_split", 0.15),

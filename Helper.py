@@ -40,7 +40,7 @@ class Config:
             "processing": {
                 "upsample_factor": 100,
                 "window_length_base": 10,
-                "window_overlap": 0.5,
+                "window_overlap": 0.25,
                 "d_max": 2,
                 "tau2_q": 0.8,
                 "tau3_q": 0.5,

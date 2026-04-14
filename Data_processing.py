@@ -10,12 +10,14 @@ Handles:
 """
 
 import json
+import pickle
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, random_split, Subset
 from typing import Dict, List, Tuple, Optional, Any
 from pathlib import Path
 from tqdm import tqdm
+import faster_sindy as faster_sindy_backend
 
 from faster_sindy import (
     PreprocessConfig, SelectionConfig, SolverConfig, ThresholdConfig,
@@ -24,6 +26,15 @@ from faster_sindy import (
 from Helper import (
     SimplicialComplex, cubic_spline_upsample_timeseries
 )
+
+
+FAST_CACHE_FILENAME = "processed_cache.pkl"
+
+
+def _force_sindy_processing_cpu() -> None:
+    """Force SINDy preprocessing to run on CPU for subject processing."""
+    faster_sindy_backend.FORCE_CPU_OVERRIDE = True
+    faster_sindy_backend.xp = np
 
 
 def _safe_subject_filename(subject_id: str) -> str:
@@ -57,6 +68,7 @@ def save_processed_dataset(
     """Save processed simplicial dataset so others can reuse it without recomputation."""
     out_dir = Path(output_dir)
     subjects_dir = out_dir / "subjects"
+    fast_cache_path = out_dir / FAST_CACHE_FILENAME
     out_dir.mkdir(parents=True, exist_ok=True)
     subjects_dir.mkdir(parents=True, exist_ok=True)
 
@@ -70,7 +82,8 @@ def save_processed_dataset(
         windows = sample.get("windows", [])
         window_payloads = [_window_to_exportable(window) for window in windows]
 
-        np.savez_compressed(
+        # Use uncompressed npz for faster readback than savez_compressed.
+        np.savez(
             file_path,
             label=np.int64(labels[i]),
             subject_id=np.array(subject_id),
@@ -104,13 +117,150 @@ def save_processed_dataset(
     with split_path.open("w", encoding="utf-8") as fp:
         json.dump(split_indices, fp, indent=2)
 
+    # Fast cache for quick full-dataset reload.
+    fast_payload = {
+        "format": "abide_sindy_simplicial_fast_v1",
+        "samples": samples,
+        "labels": labels,
+        "splits": split_indices,
+        "metadata": metadata,
+    }
+    with fast_cache_path.open("wb") as fp:
+        pickle.dump(fast_payload, fp, protocol=pickle.HIGHEST_PROTOCOL)
+
     export_summary = {
         "output_dir": str(out_dir),
         "manifest": str(manifest_path),
         "splits": str(split_path),
         "num_subject_files": len(subject_records),
+        "fast_cache": str(fast_cache_path),
     }
     return export_summary
+
+
+def _window_from_exportable(payload: Dict[str, Any]) -> SimplicialComplex:
+    node_features = np.asarray(payload.get("node_features", []), dtype=np.float32)
+
+    edges_arr = np.asarray(payload.get("edges", []), dtype=np.int32)
+    triangles_arr = np.asarray(payload.get("triangles", []), dtype=np.int32)
+
+    edges = [tuple(int(v) for v in edge) for edge in edges_arr.tolist()] if edges_arr.size > 0 else []
+    triangles = [tuple(int(v) for v in tri) for tri in triangles_arr.tolist()] if triangles_arr.size > 0 else []
+
+    edge_features = np.asarray(payload.get("edge_features", []), dtype=np.float32)
+    triangle_features = np.asarray(payload.get("triangle_features", []), dtype=np.float32)
+
+    simp = SimplicialComplex(
+        node_features=node_features,
+        edges=edges,
+        triangles=triangles,
+        edge_features=edge_features,
+        triangle_features=triangle_features,
+    )
+
+    # Preserve exact exported incidence/adjacency tensors when available.
+    if "B1" in payload:
+        simp.incidence["B1"] = np.asarray(payload["B1"], dtype=np.int8)
+    if "B2" in payload:
+        simp.incidence["B2"] = np.asarray(payload["B2"], dtype=np.int8)
+    if "H0_up" in payload:
+        simp.adjacency["H0_up"] = np.asarray(payload["H0_up"], dtype=np.float32)
+    if "H1_down" in payload:
+        simp.adjacency["H1_down"] = np.asarray(payload["H1_down"], dtype=np.float32)
+    if "H1_up" in payload:
+        simp.adjacency["H1_up"] = np.asarray(payload["H1_up"], dtype=np.float32)
+    if "H2_down" in payload:
+        simp.adjacency["H2_down"] = np.asarray(payload["H2_down"], dtype=np.float32)
+
+    return simp
+
+
+def load_processed_dataset(
+    output_dir: str,
+) -> Tuple[List[Dict[str, Any]], List[int], Dict[str, List[int]], Dict[str, Any]]:
+    """Load previously processed simplicial dataset export from disk."""
+    out_dir = Path(output_dir)
+    fast_cache_path = out_dir / FAST_CACHE_FILENAME
+    manifest_path = out_dir / "manifest.json"
+
+    if fast_cache_path.exists():
+        try:
+            with fast_cache_path.open("rb") as fp:
+                payload = pickle.load(fp)
+
+            if not isinstance(payload, dict):
+                raise ValueError("Invalid fast cache payload type")
+
+            samples = payload.get("samples", [])
+            labels = payload.get("labels", [])
+            split_indices = payload.get("splits", {})
+            metadata = payload.get("metadata", {})
+            if isinstance(metadata, dict):
+                metadata = dict(metadata)
+                metadata["_processed_cache_source"] = "fast_pickle"
+            return samples, labels, split_indices, metadata
+        except Exception:
+            # Fall back to legacy manifest+npz format if fast cache is stale/corrupt.
+            pass
+
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Processed manifest not found at {manifest_path}")
+
+    with manifest_path.open("r", encoding="utf-8") as fp:
+        manifest = json.load(fp)
+
+    subject_records = manifest.get("subjects", [])
+    samples: List[Dict[str, Any]] = []
+    labels: List[int] = []
+
+    for record in subject_records:
+        rel_file = record.get("file")
+        if not rel_file:
+            raise ValueError("Invalid manifest: subject record missing 'file'")
+
+        npz_path = out_dir / rel_file
+        if not npz_path.exists():
+            raise FileNotFoundError(f"Missing subject file: {npz_path}")
+
+        with np.load(npz_path, allow_pickle=True) as data:
+            label = int(data["label"])
+            subject_raw = data["subject_id"]
+            subject_id = str(subject_raw.item() if np.ndim(subject_raw) == 0 else subject_raw)
+
+            windows_payload = data["windows"]
+            windows = [_window_from_exportable(payload) for payload in windows_payload.tolist()]
+
+        samples.append(
+            {
+                "windows": windows,
+                "subject_id": subject_id,
+                "n_windows": len(windows),
+            }
+        )
+        labels.append(label)
+
+    split_indices = manifest.get("splits", {})
+    metadata = manifest.get("metadata", {})
+    if isinstance(metadata, dict):
+        metadata = dict(metadata)
+        metadata["_processed_cache_source"] = "legacy_npz"
+
+    # Upgrade legacy cache to fast single-file cache for subsequent runs.
+    if not fast_cache_path.exists():
+        try:
+            fast_payload = {
+                "format": "abide_sindy_simplicial_fast_v1",
+                "samples": samples,
+                "labels": labels,
+                "splits": split_indices,
+                "metadata": metadata,
+            }
+            with fast_cache_path.open("wb") as fp:
+                pickle.dump(fast_payload, fp, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception:
+            pass
+
+    return samples, labels, split_indices, metadata
 
 
 class SimplicialDataset(Dataset):
@@ -289,6 +439,9 @@ class ABIDESimplicialProcessor:
         self.threshold_cfg = ThresholdConfig(
             edge_quantile=0.90,
         )
+
+        # Subject preprocessing should remain CPU-bound; ML training uses GPU later.
+        _force_sindy_processing_cpu()
     
     def process_subject(
         self,
@@ -366,7 +519,7 @@ class ABIDESimplicialProcessor:
                 print(f"  [skip] Subject {subject_id}: no valid windows created")
                 return {"windows": [], "subject_id": subject_id, "error": "no_valid_windows"}
             
-            print(f"  [ok] Subject {subject_id}: {len(windows)} windows created")
+            #print(f"  [ok] Subject {subject_id}: {len(windows)} windows created")
             return {
                 "windows": windows,
                 "subject_id": subject_id,
@@ -476,6 +629,7 @@ def create_dataloaders(
     verbose: bool = True,
     save_processed: bool = True,
     processed_output_dir: str = "./abide_simplicial_dataset",
+    load_processed_if_available: bool = True,
     upsample_factor: int = 100,
 ) -> Tuple[DataLoader, DataLoader, DataLoader, Dict[str, Any]]:
     """
@@ -493,8 +647,9 @@ def create_dataloaders(
         random_seed: Random seed for reproducibility
         num_workers: Number of workers for data loading
         verbose: Whether to print progress
-        save_processed: Whether to export processed dataset to disk
+        save_processed: Whether to export processed dataset cache to disk
         processed_output_dir: Directory where processed dataset export is written
+        load_processed_if_available: If True, reuse existing processed export when present
         upsample_factor: Interpolation factor for upsampling timeseries
     
     Returns:
@@ -518,36 +673,56 @@ def create_dataloaders(
             n_subjects = int(n_subjects)
         except ValueError:
             n_subjects = None
-    
-    # Load ABIDE dataset
-    if verbose:
-        print(f"Loading ABIDE dataset from {data_dir}...")
-    
-    try:
-        from nilearn import datasets
-        abide_data = datasets.fetch_abide_pcp(
+
+    processed_loaded = False
+    split_indices: Dict[str, List[int]] = {}
+    loaded_metadata: Dict[str, Any] = {}
+
+    if load_processed_if_available:
+        try:
+            samples, labels, split_indices, loaded_metadata = load_processed_dataset(processed_output_dir)
+            subject_ids = [str(sample.get("subject_id", "unknown")) for sample in samples]
+            processed_loaded = True
+            if verbose:
+                src = loaded_metadata.get("_processed_cache_source", "unknown") if isinstance(loaded_metadata, dict) else "unknown"
+                print(f"Loaded processed dataset from {processed_output_dir} (source={src})")
+        except FileNotFoundError:
+            if verbose:
+                print(f"No processed dataset found at {processed_output_dir}. Running processing...")
+        except Exception as e:
+            if verbose:
+                print(f"Could not load processed dataset ({e}). Running processing...")
+
+    if not processed_loaded:
+        # Load ABIDE dataset
+        if verbose:
+            print(f"Loading ABIDE dataset from {data_dir}...")
+
+        try:
+            from nilearn import datasets
+            abide_data = datasets.fetch_abide_pcp(
+                data_dir=data_dir,
+                derivatives="rois_cc200",
+                n_subjects=n_subjects,
+                verbose=1 if verbose else 0,
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to load ABIDE dataset: {e}")
+
+        # Process dataset
+        if verbose:
+            print("Processing dataset into simplicial complexes (CPU preprocessing)...")
+
+        processor = ABIDESimplicialProcessor(
             data_dir=data_dir,
-            derivatives="rois_cc200",
-            n_subjects=n_subjects,
-            verbose=1 if verbose else 0,
+            save_intermediates=False,
+            upsample_factor=upsample_factor,
         )
-    except Exception as e:
-        raise RuntimeError(f"Failed to load ABIDE dataset: {e}")
-    
-    # Process dataset
-    if verbose:
-        print("Processing dataset into simplicial complexes...")
-    
-    processor = ABIDESimplicialProcessor(
-        data_dir=data_dir,
-        save_intermediates=False,
-        upsample_factor=upsample_factor,
-    )
-    samples, labels, subject_ids = processor.process_dataset(
-        abide_data,
-        window_len=window_length,
-        window_overlap=window_overlap,
-    )
+        samples, labels, subject_ids = processor.process_dataset(
+            abide_data,
+            window_len=window_length,
+            window_overlap=window_overlap,
+        )
     
     if not samples:
         raise RuntimeError("No samples were successfully processed")
@@ -565,17 +740,43 @@ def create_dataloaders(
     n_val = int(n_samples * val_split)
     n_test = n_samples - n_train - n_val
     
-    train_dataset, val_dataset, test_dataset = random_split(
-        dataset,
-        [n_train, n_val, n_test],
-        generator=torch.Generator().manual_seed(random_seed),
+    has_saved_splits = (
+        isinstance(split_indices, dict)
+        and all(k in split_indices for k in ("train", "val", "test"))
     )
 
-    split_indices = {
-        "train": [int(i) for i in train_dataset.indices],
-        "val": [int(i) for i in val_dataset.indices],
-        "test": [int(i) for i in test_dataset.indices],
-    }
+    if has_saved_splits:
+        train_idx = [int(i) for i in split_indices["train"]]
+        val_idx = [int(i) for i in split_indices["val"]]
+        test_idx = [int(i) for i in split_indices["test"]]
+        n_dataset = len(dataset)
+
+        valid = all(0 <= i < n_dataset for i in train_idx + val_idx + test_idx)
+        if not valid:
+            raise ValueError("Loaded split indices contain out-of-range sample indices")
+
+        train_dataset = Subset(dataset, train_idx)
+        val_dataset = Subset(dataset, val_idx)
+        test_dataset = Subset(dataset, test_idx)
+
+        split_indices = {
+            "train": train_idx,
+            "val": val_idx,
+            "test": test_idx,
+        }
+        n_train, n_val, n_test = len(train_idx), len(val_idx), len(test_idx)
+    else:
+        train_dataset, val_dataset, test_dataset = random_split(
+            dataset,
+            [n_train, n_val, n_test],
+            generator=torch.Generator().manual_seed(random_seed),
+        )
+
+        split_indices = {
+            "train": [int(i) for i in train_dataset.indices],
+            "val": [int(i) for i in val_dataset.indices],
+            "test": [int(i) for i in test_dataset.indices],
+        }
     
     if verbose:
         print(f"Train: {n_train}, Validation: {n_val}, Test: {n_test}")
@@ -612,9 +813,13 @@ def create_dataloaders(
         "labels": labels,
         "subject_ids": subject_ids,
         "label_distribution": np.bincount(labels).tolist(),
+        "loaded_from_processed": processed_loaded,
     }
 
-    if save_processed:
+    if isinstance(loaded_metadata, dict):
+        metadata.update({k: v for k, v in loaded_metadata.items() if k not in metadata})
+
+    if save_processed and not processed_loaded:
         export_info = save_processed_dataset(
             samples=samples,
             labels=labels,
@@ -625,7 +830,15 @@ def create_dataloaders(
         metadata["processed_export"] = export_info
         if verbose:
             print(f"Saved processed dataset to: {export_info['output_dir']}")
-            print(f"Manifest: {export_info['manifest']}")
+            print(f"Fast cache: {export_info['fast_cache']}")
+    elif processed_loaded:
+        metadata["processed_export"] = {
+            "output_dir": str(Path(processed_output_dir)),
+            "manifest": str(Path(processed_output_dir) / "manifest.json"),
+            "splits": str(Path(processed_output_dir) / "splits.json"),
+            "fast_cache": str(Path(processed_output_dir) / FAST_CACHE_FILENAME),
+            "num_subject_files": len(samples),
+        }
     
     return train_loader, val_loader, test_loader, metadata
 
@@ -638,6 +851,7 @@ if __name__ == "__main__":
         batch_size=16,
         verbose=True,
         save_processed=True,
+        load_processed_if_available=True,
     )
     
     print(f"\nMetadata: {metadata}")
