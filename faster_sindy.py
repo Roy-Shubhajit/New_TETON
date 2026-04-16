@@ -101,11 +101,10 @@ class WindowResult:
 
 
 def to_numpy(x):
-    # If xp is cp (GPU mode), convert from GPU array. Otherwise return as-is.
-    if xp is cp:
-        return cp.asnumpy(x)
-    else:
-        return x
+    # Convert only when the active backend provides asnumpy (e.g., CuPy).
+    if hasattr(xp, "asnumpy"):
+        return xp.asnumpy(x)
+    return x
 
 
 def _validate_input_matrix(X: np.ndarray) -> np.ndarray:

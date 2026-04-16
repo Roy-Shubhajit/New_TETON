@@ -11,6 +11,7 @@ Handles:
 
 import json
 import pickle
+from dataclasses import dataclass
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split, Subset
@@ -21,6 +22,7 @@ import faster_sindy as faster_sindy_backend
 
 from faster_sindy import (
     PreprocessConfig, SelectionConfig, SolverConfig, ThresholdConfig,
+    preprocess_timeseries,
     run_sindy_windows
 )
 from Helper import (
@@ -29,6 +31,136 @@ from Helper import (
 
 
 FAST_CACHE_FILENAME = "processed_cache.pkl"
+
+
+def _normalized_backend_name(sindy_backend: str) -> str:
+    """Normalize the backend name used to separate exported datasets."""
+    backend = str(sindy_backend).strip().lower()
+    if backend not in {"faster_sindy", "sindy"}:
+        raise ValueError("sindy_backend must be either 'faster_sindy' or 'sindy'")
+    return backend
+
+
+def _processed_backend_dir(output_dir: str, sindy_backend: str) -> Path:
+    """Return the backend-specific export directory under the dataset root."""
+    return Path(output_dir) / _normalized_backend_name(sindy_backend)
+
+
+@dataclass
+class _WindowBackendResult:
+    """Backend-agnostic minimal window payload used by process_subject."""
+
+    start: int
+    end: int
+    pred_edges: set
+    pred_tris: set
+
+
+def _sort_edges(edge_list: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    """Sort edge endpoints and return unique sorted edges."""
+    return sorted({tuple(sorted((int(u), int(v)))) for u, v in edge_list})
+
+
+def construct_topological_snapshot(
+    node_features: np.ndarray,
+    edge_list: List[Tuple[int, int]],
+    triangle_list: List[Tuple[int, int, int]],
+    agg_func: str = "mean",
+) -> Tuple[Dict[int, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray], List[Tuple[int, int]], List[Tuple[int, int, int]]]:
+    """Construct lifted features, incidence matrices, and adjacency matrices for one window."""
+    x0 = np.asarray(node_features, dtype=np.float32)
+    if x0.ndim == 1:
+        x0 = x0[:, None]
+    if x0.ndim != 2:
+        raise ValueError(f"node_features must be 1D or 2D, got shape {x0.shape}")
+
+    n_nodes, feat_dim = x0.shape
+    edges = _sort_edges(edge_list)
+    edge_to_idx = {edge: idx for idx, edge in enumerate(edges)}
+
+    def _aggregate(values: np.ndarray) -> np.ndarray:
+        if agg_func == "mean":
+            return values.mean(axis=0)
+        if agg_func == "sum":
+            return values.sum(axis=0)
+        if agg_func == "max":
+            return values.max(axis=0)
+        raise ValueError("agg_func must be 'mean', 'sum', or 'max'")
+
+    if edges:
+        x1 = np.stack([_aggregate(x0[[u, v]]) for (u, v) in edges], axis=0).astype(np.float32)
+    else:
+        x1 = np.zeros((0, feat_dim), dtype=np.float32)
+
+    # B1: nodes -> edges
+    n_edges = len(edges)
+    B1 = np.zeros((n_nodes, n_edges), dtype=np.float32)
+    for e_idx, (u, v) in enumerate(edges):
+        B1[u, e_idx] = 1.0
+        B1[v, e_idx] = 1.0
+
+    # Keep only triangles whose edges exist in edge_list.
+    valid_triangles: List[Tuple[int, int, int]] = []
+    for tri in triangle_list:
+        u, v, w = sorted((int(tri[0]), int(tri[1]), int(tri[2])))
+        e1 = tuple(sorted((u, v)))
+        e2 = tuple(sorted((v, w)))
+        e3 = tuple(sorted((u, w)))
+        if e1 in edge_to_idx and e2 in edge_to_idx and e3 in edge_to_idx:
+            valid_triangles.append((u, v, w))
+
+    n_triangles = len(valid_triangles)
+    B2 = np.zeros((n_edges, n_triangles), dtype=np.float32)
+    for t_idx, (u, v, w) in enumerate(valid_triangles):
+        B2[edge_to_idx[tuple(sorted((u, v)))], t_idx] = 1.0
+        B2[edge_to_idx[tuple(sorted((v, w)))], t_idx] = 1.0
+        B2[edge_to_idx[tuple(sorted((u, w)))], t_idx] = 1.0
+
+    if valid_triangles:
+        x2 = np.stack([_aggregate(x0[[u, v, w]]) for (u, v, w) in valid_triangles], axis=0).astype(np.float32)
+    else:
+        x2 = np.zeros((0, feat_dim), dtype=np.float32)
+
+    A0 = (B1 @ B1.T).astype(np.float32)
+    A1 = (B1.T @ B1 + B2 @ B2.T).astype(np.float32)
+    A2 = (B2.T @ B2).astype(np.float32)
+
+    features = {0: x0, 1: x1, 2: x2}
+    incidences = {
+        "rank_1": B1,
+        "rank_2": B2,
+    }
+    adjacencies = {
+        "rank_0": A0,
+        "rank_1": A1,
+        "rank_2": A2,
+    }
+    return features, incidences, adjacencies, edges, valid_triangles
+
+
+class _NumpyCompatUnpickler(pickle.Unpickler):
+    """Unpickler that remaps NumPy internal module paths across versions."""
+
+    _MODULE_REMAP = {
+        "numpy._core": "numpy.core",
+        "numpy._core.numeric": "numpy.core.numeric",
+        "numpy._core.multiarray": "numpy.core.multiarray",
+        "numpy._core.umath": "numpy.core.umath",
+    }
+
+    def find_class(self, module: str, name: str):
+        remapped_module = self._MODULE_REMAP.get(module, module)
+        return super().find_class(remapped_module, name)
+
+
+def _load_pickle_with_numpy_compat(cache_path: Path) -> Any:
+    """Load pickle cache with NumPy module-path compatibility fallbacks."""
+    with cache_path.open("rb") as fp:
+        try:
+            return pickle.load(fp)
+        except ModuleNotFoundError:
+            fp.seek(0)
+            return _NumpyCompatUnpickler(fp).load()
 
 
 def _force_sindy_processing_cpu() -> None:
@@ -43,18 +175,41 @@ def _safe_subject_filename(subject_id: str) -> str:
 
 
 def _window_to_exportable(window: SimplicialComplex) -> Dict[str, Any]:
+    features_dict = getattr(window, "features", {}) if hasattr(window, "features") else {}
+    rank0_features = np.asarray(features_dict.get("rank_0", window.node_features), dtype=np.float32)
+    rank1_features = np.asarray(features_dict.get("rank_1", window.edge_features), dtype=np.float32)
+    rank2_features = np.asarray(features_dict.get("rank_2", window.triangle_features), dtype=np.float32)
+
+    incidence_rank_1 = np.asarray(window.incidence.get("rank_1", window.incidence["B1"]), dtype=np.int8)
+    incidence_rank_2 = np.asarray(window.incidence.get("rank_2", window.incidence["B2"]), dtype=np.int8)
+
+    adjacency_rank_0 = np.asarray(window.adjacency.get("rank_0", window.adjacency["H0_up"]), dtype=np.float32)
+    adjacency_rank_1 = np.asarray(window.adjacency.get("rank_1", window.adjacency["H1_down"]), dtype=np.float32)
+    adjacency_rank_2 = np.asarray(window.adjacency.get("rank_2", window.adjacency["H2_down"]), dtype=np.float32)
+
     return {
-        "node_features": np.asarray(window.node_features, dtype=np.float32),
-        "edge_features": np.asarray(window.edge_features, dtype=np.float32),
-        "triangle_features": np.asarray(window.triangle_features, dtype=np.float32),
-        "edges": np.asarray(window.incidence["edges"], dtype=np.int32),
-        "triangles": np.asarray(window.incidence["triangles"], dtype=np.int32),
-        "B1": np.asarray(window.incidence["B1"], dtype=np.int8),
-        "B2": np.asarray(window.incidence["B2"], dtype=np.int8),
-        "H0_up": np.asarray(window.adjacency["H0_up"], dtype=np.float32),
-        "H1_down": np.asarray(window.adjacency["H1_down"], dtype=np.float32),
-        "H1_up": np.asarray(window.adjacency["H1_up"], dtype=np.float32),
-        "H2_down": np.asarray(window.adjacency["H2_down"], dtype=np.float32),
+        "node_features": rank0_features,
+        "edge_features": rank1_features,
+        "triangle_features": rank2_features,
+        "rank_0_features": rank0_features,
+        "rank_1_features": rank1_features,
+        "rank_2_features": rank2_features,
+        "edges": _edge_array(window.incidence["edges"]),
+        "triangles": _triangle_array(window.incidence["triangles"]),
+        "rank_1": incidence_rank_1,
+        "rank_2": incidence_rank_2,
+        "B1": incidence_rank_1,
+        "B2": incidence_rank_2,
+        "A0": adjacency_rank_0,
+        "A1": adjacency_rank_1,
+        "A2": adjacency_rank_2,
+        "rank_0": adjacency_rank_0,
+        "rank_1_adj": adjacency_rank_1,
+        "rank_2_adj": adjacency_rank_2,
+        "H0_up": adjacency_rank_0,
+        "H1_down": adjacency_rank_1,
+        "H1_up": np.asarray(window.adjacency.get("H1_up", np.zeros_like(adjacency_rank_1)), dtype=np.float32),
+        "H2_down": adjacency_rank_2,
     }
 
 
@@ -64,9 +219,11 @@ def save_processed_dataset(
     split_indices: Dict[str, List[int]],
     metadata: Dict[str, Any],
     output_dir: str,
+    sindy_backend: str,
 ) -> Dict[str, Any]:
     """Save processed simplicial dataset so others can reuse it without recomputation."""
-    out_dir = Path(output_dir)
+    backend_name = _normalized_backend_name(sindy_backend)
+    out_dir = _processed_backend_dir(output_dir, backend_name)
     subjects_dir = out_dir / "subjects"
     fast_cache_path = out_dir / FAST_CACHE_FILENAME
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -103,6 +260,7 @@ def save_processed_dataset(
 
     export_manifest = {
         "format": "abide_sindy_simplicial_v1",
+        "sindy_backend": backend_name,
         "num_samples": len(samples),
         "splits": split_indices,
         "metadata": metadata,
@@ -120,6 +278,7 @@ def save_processed_dataset(
     # Fast cache for quick full-dataset reload.
     fast_payload = {
         "format": "abide_sindy_simplicial_fast_v1",
+        "sindy_backend": backend_name,
         "samples": samples,
         "labels": labels,
         "splits": split_indices,
@@ -130,6 +289,7 @@ def save_processed_dataset(
 
     export_summary = {
         "output_dir": str(out_dir),
+        "sindy_backend": backend_name,
         "manifest": str(manifest_path),
         "splits": str(split_path),
         "num_subject_files": len(subject_records),
@@ -139,7 +299,7 @@ def save_processed_dataset(
 
 
 def _window_from_exportable(payload: Dict[str, Any]) -> SimplicialComplex:
-    node_features = np.asarray(payload.get("node_features", []), dtype=np.float32)
+    node_features = np.asarray(payload.get("rank_0_features", payload.get("node_features", [])), dtype=np.float32)
 
     edges_arr = np.asarray(payload.get("edges", []), dtype=np.int32)
     triangles_arr = np.asarray(payload.get("triangles", []), dtype=np.int32)
@@ -147,8 +307,8 @@ def _window_from_exportable(payload: Dict[str, Any]) -> SimplicialComplex:
     edges = [tuple(int(v) for v in edge) for edge in edges_arr.tolist()] if edges_arr.size > 0 else []
     triangles = [tuple(int(v) for v in tri) for tri in triangles_arr.tolist()] if triangles_arr.size > 0 else []
 
-    edge_features = np.asarray(payload.get("edge_features", []), dtype=np.float32)
-    triangle_features = np.asarray(payload.get("triangle_features", []), dtype=np.float32)
+    edge_features = np.asarray(payload.get("rank_1_features", payload.get("edge_features", [])), dtype=np.float32)
+    triangle_features = np.asarray(payload.get("rank_2_features", payload.get("triangle_features", [])), dtype=np.float32)
 
     simp = SimplicialComplex(
         node_features=node_features,
@@ -159,49 +319,109 @@ def _window_from_exportable(payload: Dict[str, Any]) -> SimplicialComplex:
     )
 
     # Preserve exact exported incidence/adjacency tensors when available.
-    if "B1" in payload:
-        simp.incidence["B1"] = np.asarray(payload["B1"], dtype=np.int8)
-    if "B2" in payload:
-        simp.incidence["B2"] = np.asarray(payload["B2"], dtype=np.int8)
-    if "H0_up" in payload:
-        simp.adjacency["H0_up"] = np.asarray(payload["H0_up"], dtype=np.float32)
-    if "H1_down" in payload:
-        simp.adjacency["H1_down"] = np.asarray(payload["H1_down"], dtype=np.float32)
+    rank_1_inc = np.asarray(payload.get("rank_1", payload.get("B1", simp.incidence.get("B1"))), dtype=np.int8)
+    rank_2_inc = np.asarray(payload.get("rank_2", payload.get("B2", simp.incidence.get("B2"))), dtype=np.int8)
+    simp.incidence["rank_1"] = rank_1_inc
+    simp.incidence["rank_2"] = rank_2_inc
+    simp.incidence["B1"] = rank_1_inc
+    simp.incidence["B2"] = rank_2_inc
+
+    rank_0_adj = np.asarray(payload.get("rank_0", payload.get("A0", payload.get("H0_up", simp.adjacency.get("H0_up")))), dtype=np.float32)
+    rank_1_adj = np.asarray(payload.get("rank_1_adj", payload.get("A1", payload.get("H1_down", simp.adjacency.get("H1_down")))), dtype=np.float32)
+    rank_2_adj = np.asarray(payload.get("rank_2_adj", payload.get("A2", payload.get("H2_down", simp.adjacency.get("H2_down")))), dtype=np.float32)
+    simp.adjacency["rank_0"] = rank_0_adj
+    simp.adjacency["rank_1"] = rank_1_adj
+    simp.adjacency["rank_2"] = rank_2_adj
+    simp.adjacency["H0_up"] = rank_0_adj
+    simp.adjacency["H1_down"] = rank_1_adj
+    simp.adjacency["H2_down"] = rank_2_adj
     if "H1_up" in payload:
         simp.adjacency["H1_up"] = np.asarray(payload["H1_up"], dtype=np.float32)
-    if "H2_down" in payload:
-        simp.adjacency["H2_down"] = np.asarray(payload["H2_down"], dtype=np.float32)
+    else:
+        simp.adjacency["H1_up"] = np.zeros_like(rank_1_adj, dtype=np.float32)
+
+    simp.features = {
+        "rank_0": np.asarray(node_features, dtype=np.float32),
+        "rank_1": np.asarray(edge_features, dtype=np.float32),
+        "rank_2": np.asarray(triangle_features, dtype=np.float32),
+    }
+    simp.incidences = {
+        "rank_1": rank_1_inc,
+        "rank_2": rank_2_inc,
+    }
+    simp.adjacencies = {
+        "rank_0": rank_0_adj,
+        "rank_1": rank_1_adj,
+        "rank_2": rank_2_adj,
+    }
 
     return simp
 
 
+def _ensure_temporal_matrix(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr[:, None]
+    if arr.ndim != 2:
+        raise ValueError(f"Expected array with shape (n_items,) or (n_items, feature_dim), got {arr.shape}")
+    return arr
+
+
+def _edge_array(edges: List[Tuple[int, int]]) -> np.ndarray:
+    arr = np.asarray(edges, dtype=np.int32)
+    if arr.size == 0:
+        return np.zeros((0, 2), dtype=np.int32)
+    return arr.reshape(-1, 2)
+
+
+def _triangle_array(triangles: List[Tuple[int, int, int]]) -> np.ndarray:
+    arr = np.asarray(triangles, dtype=np.int32)
+    if arr.size == 0:
+        return np.zeros((0, 3), dtype=np.int32)
+    return arr.reshape(-1, 3)
+
+
 def load_processed_dataset(
     output_dir: str,
+    sindy_backend: str,
+    allow_npz_fallback: bool = False,
 ) -> Tuple[List[Dict[str, Any]], List[int], Dict[str, List[int]], Dict[str, Any]]:
-    """Load previously processed simplicial dataset export from disk."""
-    out_dir = Path(output_dir)
+    """Load previously processed simplicial dataset export from disk.
+
+    By default this loads only from the fast pickle cache. Legacy manifest+npz
+    loading is available only when allow_npz_fallback=True.
+    """
+    backend_name = _normalized_backend_name(sindy_backend)
+    out_dir = _processed_backend_dir(output_dir, backend_name)
     fast_cache_path = out_dir / FAST_CACHE_FILENAME
     manifest_path = out_dir / "manifest.json"
 
-    if fast_cache_path.exists():
-        try:
-            with fast_cache_path.open("rb") as fp:
-                payload = pickle.load(fp)
+    if not fast_cache_path.exists():
+        legacy_cache_path = Path(output_dir) / FAST_CACHE_FILENAME
+        if legacy_cache_path.exists():
+            fast_cache_path = legacy_cache_path
+            out_dir = Path(output_dir)
+        else:
+            raise FileNotFoundError(f"Processed pickle cache not found at {fast_cache_path}")
 
-            if not isinstance(payload, dict):
-                raise ValueError("Invalid fast cache payload type")
+    try:
+        payload = _load_pickle_with_numpy_compat(fast_cache_path)
 
-            samples = payload.get("samples", [])
-            labels = payload.get("labels", [])
-            split_indices = payload.get("splits", {})
-            metadata = payload.get("metadata", {})
-            if isinstance(metadata, dict):
-                metadata = dict(metadata)
-                metadata["_processed_cache_source"] = "fast_pickle"
-            return samples, labels, split_indices, metadata
-        except Exception:
-            # Fall back to legacy manifest+npz format if fast cache is stale/corrupt.
-            pass
+        if not isinstance(payload, dict):
+            raise ValueError("Invalid fast cache payload type")
+
+        samples = payload.get("samples", [])
+        labels = payload.get("labels", [])
+        split_indices = payload.get("splits", {})
+        metadata = payload.get("metadata", {})
+        if isinstance(metadata, dict):
+            metadata = dict(metadata)
+            metadata["_processed_cache_source"] = "fast_pickle"
+            metadata["sindy_backend"] = payload.get("sindy_backend", backend_name)
+        return samples, labels, split_indices, metadata
+    except Exception as exc:
+        if not allow_npz_fallback:
+            raise RuntimeError(f"Failed to load pickle cache: {exc}") from exc
 
     if not manifest_path.exists():
         raise FileNotFoundError(f"Processed manifest not found at {manifest_path}")
@@ -244,12 +464,14 @@ def load_processed_dataset(
     if isinstance(metadata, dict):
         metadata = dict(metadata)
         metadata["_processed_cache_source"] = "legacy_npz"
+        metadata["sindy_backend"] = manifest.get("sindy_backend", backend_name)
 
     # Upgrade legacy cache to fast single-file cache for subsequent runs.
     if not fast_cache_path.exists():
         try:
             fast_payload = {
                 "format": "abide_sindy_simplicial_fast_v1",
+                "sindy_backend": backend_name,
                 "samples": samples,
                 "labels": labels,
                 "splits": split_indices,
@@ -320,9 +542,9 @@ def simplicial_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor
     
     Returns:
         Dictionary with:
-        - node_features: (batch_size, max_seq_len, max_nodes)
-        - edge_features: (batch_size, max_seq_len, max_edges, 4)
-        - triangle_features: (batch_size, max_seq_len, max_triangles, 4)
+        - node_features: (batch_size, max_seq_len, max_nodes, node_feature_dim)
+        - edge_features: (batch_size, max_seq_len, max_edges, edge_feature_dim)
+        - triangle_features: (batch_size, max_seq_len, max_triangles, triangle_feature_dim)
         - labels: (batch_size,)
         - lengths: (batch_size,) - actual sequence lengths
         - subject_ids: List of subject IDs
@@ -341,24 +563,38 @@ def simplicial_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor
     max_nodes = 0
     max_edges = 0
     max_triangles = 0
+    node_feat_dim = 1
+    edge_feat_dim = 1
+    triangle_feat_dim = 1
     
     for windows in batch_windows:
         for window in windows:
             max_nodes = max(max_nodes, window.n_nodes)
             max_edges = max(max_edges, window.incidence["n_edges"])
             max_triangles = max(max_triangles, window.incidence["n_triangles"])
+            node_feat_dim = max(node_feat_dim, _ensure_temporal_matrix(window.node_features).shape[1])
+            edge_arr = np.asarray(window.edge_features, dtype=np.float32)
+            tri_arr = np.asarray(window.triangle_features, dtype=np.float32)
+            if edge_arr.ndim == 1:
+                edge_arr = edge_arr[:, None]
+            if tri_arr.ndim == 1:
+                tri_arr = tri_arr[:, None]
+            if edge_arr.size > 0:
+                edge_feat_dim = max(edge_feat_dim, edge_arr.shape[1])
+            if tri_arr.size > 0:
+                triangle_feat_dim = max(triangle_feat_dim, tri_arr.shape[1])
     
     # Initialize padded tensors
     node_features = torch.zeros(
-        (batch_size, max_seq_len, max_nodes),
+        (batch_size, max_seq_len, max_nodes, node_feat_dim),
         dtype=torch.float32
     )
     edge_features = torch.zeros(
-        (batch_size, max_seq_len, max_edges, 4),
+        (batch_size, max_seq_len, max_edges, edge_feat_dim),
         dtype=torch.float32
     )
     triangle_features = torch.zeros(
-        (batch_size, max_seq_len, max_triangles, 4),
+        (batch_size, max_seq_len, max_triangles, triangle_feat_dim),
         dtype=torch.float32
     )
     
@@ -367,19 +603,24 @@ def simplicial_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor
         for w_idx, window in enumerate(windows):
             # Node features
             n_nodes = window.n_nodes
-            node_features[b_idx, w_idx, :n_nodes] = torch.from_numpy(window.node_features)
+            node_arr = _ensure_temporal_matrix(window.node_features)
+            node_features[b_idx, w_idx, :n_nodes, :node_arr.shape[1]] = torch.from_numpy(node_arr)
             
             # Edge features
-            n_edges = window.edge_features.shape[0]
+            edge_arr = np.asarray(window.edge_features, dtype=np.float32)
+            if edge_arr.ndim == 1:
+                edge_arr = edge_arr[:, None]
+            n_edges = edge_arr.shape[0]
             if n_edges > 0:
-                edge_features[b_idx, w_idx, :n_edges] = torch.from_numpy(window.edge_features)
+                edge_features[b_idx, w_idx, :n_edges, :edge_arr.shape[1]] = torch.from_numpy(edge_arr)
             
             # Triangle features
-            n_triangles = window.triangle_features.shape[0]
+            tri_arr = np.asarray(window.triangle_features, dtype=np.float32)
+            if tri_arr.ndim == 1:
+                tri_arr = tri_arr[:, None]
+            n_triangles = tri_arr.shape[0]
             if n_triangles > 0:
-                triangle_features[b_idx, w_idx, :n_triangles] = torch.from_numpy(
-                    window.triangle_features
-                )
+                triangle_features[b_idx, w_idx, :n_triangles, :tri_arr.shape[1]] = torch.from_numpy(tri_arr)
     
     return {
         "node_features": node_features,
@@ -389,6 +630,17 @@ def simplicial_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor
         "lengths": batch_lengths,
         "subject_ids": batch_subject_ids,
     }
+
+
+def single_subject_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return a single subject sample unchanged.
+
+    The training loop processes one subject at a time, so the dataloader
+    should yield raw subject dictionaries instead of stacking tensors.
+    """
+    if len(batch) != 1:
+        raise ValueError("single_subject_collate_fn expects batch_size=1")
+    return batch[0]
 
 
 class ABIDESimplicialProcessor:
@@ -401,6 +653,7 @@ class ABIDESimplicialProcessor:
         data_dir: str = "./",
         save_intermediates: bool = False,
         upsample_factor: int = 100,
+        sindy_backend: str = "faster_sindy",
     ):
         """
         Initialize processor.
@@ -413,6 +666,9 @@ class ABIDESimplicialProcessor:
         self.data_dir = Path(data_dir)
         self.save_intermediates = save_intermediates
         self.upsample_factor = upsample_factor
+        self.sindy_backend = str(sindy_backend).strip().lower()
+        if self.sindy_backend not in {"faster_sindy", "sindy"}:
+            raise ValueError("sindy_backend must be either 'faster_sindy' or 'sindy'")
         
         # Create config objects for processing
         self.preprocess_cfg = PreprocessConfig(
@@ -440,8 +696,69 @@ class ABIDESimplicialProcessor:
             edge_quantile=0.90,
         )
 
-        # Subject preprocessing should remain CPU-bound; ML training uses GPU later.
-        _force_sindy_processing_cpu()
+        # Keep faster_sindy preprocessing CPU-bound; ML training uses GPU later.
+        if self.sindy_backend == "faster_sindy":
+            _force_sindy_processing_cpu()
+
+    def _run_sindy_backend_windows(
+        self,
+        X_raw: np.ndarray,
+        window_len: int,
+        stride: int,
+    ) -> List[_WindowBackendResult]:
+        """Run selected backend and normalize window outputs."""
+        if self.sindy_backend == "faster_sindy":
+            backend_results = run_sindy_windows(
+                X_raw,
+                window_size=window_len,
+                stride=stride,
+                preprocess_cfg=self.preprocess_cfg,
+                selection_cfg=self.selection_cfg,
+                solver_cfg=self.solver_cfg,
+                threshold_cfg=self.threshold_cfg,
+            )
+            return [
+                _WindowBackendResult(
+                    start=int(r.start),
+                    end=int(r.end),
+                    pred_edges={frozenset(tuple(sorted(tuple(e)))) for e in r.pred_edges},
+                    pred_tris={frozenset(tuple(sorted(tuple(t)))) for t in r.pred_tris},
+                )
+                for r in backend_results
+            ]
+
+        # Legacy backend: adapt sindy.py payload to match faster_sindy window schema.
+        import sindy as legacy_sindy
+
+        args = legacy_sindy.SindyArgs(
+            win_len=int(window_len),
+            stride=int(stride),
+            overlap=float(1.0 - (float(stride) / float(max(1, window_len)))),
+            fs=float(self.preprocess_cfg.fs),
+            win_sg=int(self.preprocess_cfg.win_sg),
+            order=int(self.preprocess_cfg.poly_order),
+            r_target_pc=float(self.selection_cfg.r_target_pc),
+            k_min=int(self.selection_cfg.k_min),
+            k_max=int(self.selection_cfg.k_max),
+            scale=float(self.solver_cfg.lambda_scale),
+            tau2_q=float(self.threshold_cfg.edge_quantile),
+            tau3_q=float(self.threshold_cfg.edge_quantile),
+        )
+
+        backend_results = legacy_sindy.process_data_in_windows(X_raw, args)
+        out: List[_WindowBackendResult] = []
+        for r in backend_results:
+            raw_edges = r.get("edges", [])
+            raw_tris = r.get("triangles", [])
+            out.append(
+                _WindowBackendResult(
+                    start=int(r.get("window_start", 0)),
+                    end=int(r.get("window_end", 0)),
+                    pred_edges={frozenset(tuple(sorted(tuple(e)))) for e in raw_edges},
+                    pred_tris={frozenset(tuple(sorted(tuple(t)))) for t in raw_tris},
+                )
+            )
+        return out
     
     def process_subject(
         self,
@@ -469,23 +786,21 @@ class ABIDESimplicialProcessor:
             # faster_sindy expects shape (N, T), while ABIDE comes as (T, N).
             X_raw = np.asarray(subject_ts, dtype=np.float64).T
 
-            n_nodes, n_timepoints = X_raw.shape
-
             # Apply upsampling interpolation if factor > 1
             if self.upsample_factor > 1:
                 X_raw = cubic_spline_upsample_timeseries(X_raw.T, factor=self.upsample_factor).T
 
+            # Keep the exported features aligned with the exact preprocessing used by SINDy.
+            X_proc, _ = preprocess_timeseries(X_raw, self.preprocess_cfg, drop_degenerate=True)
+            n_nodes = X_proc.shape[0]
+
             stride = max(1, int(round(window_len * (1.0 - window_overlap))))
 
-            # Run SINDy window solver and use its predicted edges/triangles directly.
-            sindy_windows = run_sindy_windows(
-                X_raw,
-                window_size=window_len,
+            # Run selected SINDy backend and normalize to a common window schema.
+            sindy_windows = self._run_sindy_backend_windows(
+                X_raw=X_raw,
+                window_len=window_len,
                 stride=stride,
-                preprocess_cfg=self.preprocess_cfg,
-                selection_cfg=self.selection_cfg,
-                solver_cfg=self.solver_cfg,
-                threshold_cfg=self.threshold_cfg,
             )
 
             if not sindy_windows:
@@ -498,16 +813,63 @@ class ABIDESimplicialProcessor:
                     end = int(result.end)
 
                     # Temporal node values for this processed window.
-                    node_temporal = X_raw[:, start:end].mean(axis=1).astype(np.float32, copy=False)
+                    node_temporal = X_proc[:, start:end].astype(np.float32, copy=False)
 
-                    edges = [tuple(sorted(tuple(edge))) for edge in result.pred_edges]
-                    triangles = [tuple(sorted(tuple(tri))) for tri in result.pred_tris]
+                    edges_in = [tuple(sorted(tuple(edge))) for edge in result.pred_edges]
+                    triangles_in = [tuple(sorted(tuple(tri))) for tri in result.pred_tris]
+
+                    features, incidences, adjacencies, edges, triangles = construct_topological_snapshot(
+                        node_features=node_temporal,
+                        edge_list=edges_in,
+                        triangle_list=triangles_in,
+                        agg_func="mean",
+                    )
 
                     simp = SimplicialComplex(
-                        node_features=node_temporal,
+                        node_features=features[0],
                         edges=edges,
                         triangles=triangles,
+                        edge_features=features[1],
+                        triangle_features=features[2],
                     )
+
+                    # Use explicit matrices from snapshot builder.
+                    rank_1_inc = incidences["rank_1"].astype(np.int8)
+                    rank_2_inc = incidences["rank_2"].astype(np.int8)
+                    simp.incidence["rank_1"] = rank_1_inc
+                    simp.incidence["rank_2"] = rank_2_inc
+                    simp.incidence["B1"] = rank_1_inc
+                    simp.incidence["B2"] = rank_2_inc
+                    simp.incidence["edges"] = edges
+                    simp.incidence["triangles"] = triangles
+                    simp.incidence["n_edges"] = len(edges)
+                    simp.incidence["n_triangles"] = len(triangles)
+
+                    rank_0_adj = adjacencies["rank_0"].astype(np.float32)
+                    rank_1_adj = adjacencies["rank_1"].astype(np.float32)
+                    rank_2_adj = adjacencies["rank_2"].astype(np.float32)
+                    simp.adjacency["rank_0"] = rank_0_adj
+                    simp.adjacency["rank_1"] = rank_1_adj
+                    simp.adjacency["rank_2"] = rank_2_adj
+                    simp.adjacency["H0_up"] = rank_0_adj
+                    simp.adjacency["H1_down"] = rank_1_adj
+                    simp.adjacency["H1_up"] = np.zeros_like(rank_1_adj, dtype=np.float32)
+                    simp.adjacency["H2_down"] = rank_2_adj
+
+                    simp.features = {
+                        "rank_0": np.asarray(features[0], dtype=np.float32),
+                        "rank_1": np.asarray(features[1], dtype=np.float32),
+                        "rank_2": np.asarray(features[2], dtype=np.float32),
+                    }
+                    simp.incidences = {
+                        "rank_1": rank_1_inc,
+                        "rank_2": rank_2_inc,
+                    }
+                    simp.adjacencies = {
+                        "rank_0": rank_0_adj,
+                        "rank_1": rank_1_adj,
+                        "rank_2": rank_2_adj,
+                    }
 
                     windows.append(simp)
 
@@ -631,6 +993,7 @@ def create_dataloaders(
     processed_output_dir: str = "./abide_simplicial_dataset",
     load_processed_if_available: bool = True,
     upsample_factor: int = 100,
+    sindy_backend: str = "faster_sindy",
 ) -> Tuple[DataLoader, DataLoader, DataLoader, Dict[str, Any]]:
     """
     Create train, validation, and test dataloaders for ABIDE data.
@@ -640,7 +1003,7 @@ def create_dataloaders(
         n_subjects: Number of subjects to process (None for all)
         window_length: Length of each processing window
         window_overlap: Overlap between windows
-        batch_size: Batch size for dataloaders
+        batch_size: Kept for API compatibility; loaders are always subject-wise.
         train_split: Fraction for training (0-1)
         val_split: Fraction for validation (0-1)
         test_split: Fraction for testing (0-1)
@@ -651,6 +1014,7 @@ def create_dataloaders(
         processed_output_dir: Directory where processed dataset export is written
         load_processed_if_available: If True, reuse existing processed export when present
         upsample_factor: Interpolation factor for upsampling timeseries
+        sindy_backend: Backend solver to use, either 'faster_sindy' or 'sindy'
     
     Returns:
         Tuple of (train_loader, val_loader, test_loader, metadata_dict)
@@ -677,18 +1041,34 @@ def create_dataloaders(
     processed_loaded = False
     split_indices: Dict[str, List[int]] = {}
     loaded_metadata: Dict[str, Any] = {}
+    processed_backend_dir = _processed_backend_dir(processed_output_dir, sindy_backend)
 
     if load_processed_if_available:
         try:
-            samples, labels, split_indices, loaded_metadata = load_processed_dataset(processed_output_dir)
+            samples, labels, split_indices, loaded_metadata = load_processed_dataset(
+                processed_output_dir,
+                sindy_backend=sindy_backend,
+            )
             subject_ids = [str(sample.get("subject_id", "unknown")) for sample in samples]
-            processed_loaded = True
+            loaded_backend = (
+                loaded_metadata.get("sindy_backend", "faster_sindy")
+                if isinstance(loaded_metadata, dict)
+                else "faster_sindy"
+            )
+            if str(loaded_backend).lower() == str(sindy_backend).lower():
+                processed_loaded = True
+            else:
+                if verbose:
+                    print(
+                        f"Processed cache backend mismatch (cache={loaded_backend}, requested={sindy_backend}). "
+                        "Reprocessing..."
+                    )
             if verbose:
                 src = loaded_metadata.get("_processed_cache_source", "unknown") if isinstance(loaded_metadata, dict) else "unknown"
-                print(f"Loaded processed dataset from {processed_output_dir} (source={src})")
+                print(f"Loaded processed dataset from {processed_backend_dir} (source={src})")
         except FileNotFoundError:
             if verbose:
-                print(f"No processed dataset found at {processed_output_dir}. Running processing...")
+                print(f"No processed dataset found at {processed_backend_dir}. Running processing...")
         except Exception as e:
             if verbose:
                 print(f"Could not load processed dataset ({e}). Running processing...")
@@ -717,6 +1097,7 @@ def create_dataloaders(
             data_dir=data_dir,
             save_intermediates=False,
             upsample_factor=upsample_factor,
+            sindy_backend=sindy_backend,
         )
         samples, labels, subject_ids = processor.process_dataset(
             abide_data,
@@ -784,23 +1165,26 @@ def create_dataloaders(
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
+        batch_size=1,
         shuffle=True,
         num_workers=num_workers,
+        collate_fn=single_subject_collate_fn,
     )
     
     val_loader = DataLoader(
         val_dataset,
-        batch_size=batch_size,
+        batch_size=1,
         shuffle=False,
         num_workers=num_workers,
+        collate_fn=single_subject_collate_fn,
     )
     
     test_loader = DataLoader(
         test_dataset,
-        batch_size=batch_size,
+        batch_size=1,
         shuffle=False,
         num_workers=num_workers,
+        collate_fn=single_subject_collate_fn,
     )
     
     # Prepare metadata
@@ -814,6 +1198,7 @@ def create_dataloaders(
         "subject_ids": subject_ids,
         "label_distribution": np.bincount(labels).tolist(),
         "loaded_from_processed": processed_loaded,
+        "sindy_backend": str(sindy_backend).lower(),
     }
 
     if isinstance(loaded_metadata, dict):
@@ -826,6 +1211,7 @@ def create_dataloaders(
             split_indices=split_indices,
             metadata=metadata,
             output_dir=processed_output_dir,
+            sindy_backend=sindy_backend,
         )
         metadata["processed_export"] = export_info
         if verbose:
@@ -833,13 +1219,15 @@ def create_dataloaders(
             print(f"Fast cache: {export_info['fast_cache']}")
     elif processed_loaded:
         metadata["processed_export"] = {
-            "output_dir": str(Path(processed_output_dir)),
-            "manifest": str(Path(processed_output_dir) / "manifest.json"),
-            "splits": str(Path(processed_output_dir) / "splits.json"),
-            "fast_cache": str(Path(processed_output_dir) / FAST_CACHE_FILENAME),
+            "output_dir": str(processed_backend_dir),
+            "manifest": str(processed_backend_dir / "manifest.json"),
+            "splits": str(processed_backend_dir / "splits.json"),
+            "fast_cache": str(processed_backend_dir / FAST_CACHE_FILENAME),
             "num_subject_files": len(samples),
+            "sindy_backend": _normalized_backend_name(sindy_backend),
         }
     
+
     return train_loader, val_loader, test_loader, metadata
 
 
@@ -848,7 +1236,7 @@ if __name__ == "__main__":
     train_loader, val_loader, test_loader, metadata = create_dataloaders(
         data_dir="./ABIDE_pcp",
         n_subjects="all",
-        batch_size=16,
+        batch_size=1,
         verbose=True,
         save_processed=True,
         load_processed_if_available=True,

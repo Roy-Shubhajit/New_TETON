@@ -47,16 +47,16 @@ class Config:
             },
             # Model settings
             "model": {
-                "name": "SCCN_LSTM",
+                "name": "TemporalSCCN_v3",
                 "sccn_layers": 2,
-                "lstm_hidden": 128,
-                "lstm_layers": 1,
+                "lstm_hidden": 512,
+                "lstm_layers": 2,
                 "dropout": 0.3,
                 "output_classes": 2,  # DX_GROUP (ASD vs Control)
             },
             # Training settings
             "training": {
-                "batch_size": 32,
+                "batch_size": 32,  # Number of subjects per optimizer step
                 "num_epochs": 50,
                 "learning_rate": 0.001,
                 "weight_decay": 1e-5,
@@ -287,6 +287,15 @@ def build_simplicial_adjacency_matrices(
     }
 
 
+def _ensure_temporal_matrix(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr[:, None]
+    if arr.ndim != 2:
+        raise ValueError(f"Expected node features with shape (n_nodes,) or (n_nodes, window_length), got {arr.shape}")
+    return arr
+
+
 def create_node_edge_features(
     node_temporal_values: np.ndarray,
     edges: List[Tuple[int, int]],
@@ -301,22 +310,21 @@ def create_node_edge_features(
     Returns:
         Dictionary with edge feature statistics
     """
+    x0 = _ensure_temporal_matrix(node_temporal_values)
     edges = [tuple(sorted(e)) for e in edges]
     n_edges = len(edges)
+    feat_dim = x0.shape[1]
     
-    # Edge features: combination of node features
-    edge_features = np.zeros((n_edges, 4), dtype=np.float32)  # sum, mean, max, min
+    # Edge features preserve the temporal axis and combine the corresponding nodes pointwise.
+    edge_features = np.zeros((n_edges, feat_dim), dtype=np.float32)
     
     for e_idx, (i, j) in enumerate(edges):
-        node_vals = [node_temporal_values[i], node_temporal_values[j]]
-        edge_features[e_idx, 0] = np.sum(node_vals)
-        edge_features[e_idx, 1] = np.mean(node_vals)
-        edge_features[e_idx, 2] = np.max(node_vals)
-        edge_features[e_idx, 3] = np.min(node_vals)
+        node_vals = x0[[i, j]]
+        edge_features[e_idx] = node_vals.mean(axis=0)
     
     return {
         "edge_features": edge_features,
-        "n_edge_features": 4,
+        "n_edge_features": feat_dim,
     }
 
 
@@ -334,22 +342,21 @@ def create_node_triangle_features(
     Returns:
         Dictionary with triangle feature statistics
     """
+    x0 = _ensure_temporal_matrix(node_temporal_values)
     triangles = [tuple(sorted(t)) for t in triangles]
     n_triangles = len(triangles)
+    feat_dim = x0.shape[1]
     
-    # Triangle features: combination of node features
-    triangle_features = np.zeros((n_triangles, 4), dtype=np.float32)  # sum, mean, max, min
+    # Triangle features preserve the temporal axis and combine the corresponding nodes pointwise.
+    triangle_features = np.zeros((n_triangles, feat_dim), dtype=np.float32)
     
     for t_idx, (i, j, k) in enumerate(triangles):
-        node_vals = [node_temporal_values[i], node_temporal_values[j], node_temporal_values[k]]
-        triangle_features[t_idx, 0] = np.sum(node_vals)
-        triangle_features[t_idx, 1] = np.mean(node_vals)
-        triangle_features[t_idx, 2] = np.max(node_vals)
-        triangle_features[t_idx, 3] = np.min(node_vals)
+        node_vals = x0[[i, j, k]]
+        triangle_features[t_idx] = node_vals.mean(axis=0)
     
     return {
         "triangle_features": triangle_features,
-        "n_triangle_features": 4,
+        "n_triangle_features": feat_dim,
     }
 
 
@@ -374,16 +381,16 @@ class SimplicialComplex:
         Initialize simplicial complex.
         
         Args:
-            node_features: Shape (n_nodes,) - temporal values at each node
+            node_features: Shape (n_nodes,) or (n_nodes, window_length)
             edges: List of (i, j) edges
             triangles: List of (i, j, k) triangles
-            edge_features: Optional shape (n_edges, ...)
-            triangle_features: Optional shape (n_triangles, ...)
+            edge_features: Optional shape (n_edges, feature_dim)
+            triangle_features: Optional shape (n_triangles, feature_dim)
             edge_weights: Optional shape (n_edges,)
             triangle_weights: Optional shape (n_triangles,)
         """
-        self.n_nodes = len(node_features)
-        self.node_features = node_features
+        self.node_features = np.asarray(node_features, dtype=np.float32)
+        self.n_nodes = len(self.node_features)
         self.edges = edges
         self.triangles = triangles
         
@@ -454,7 +461,7 @@ def pad_sequence_windows(
     
     Returns:
         Tuple of (padded_node_features, padded_edge_features, padded_triangle_features)
-        with shape (n_windows, max_dim, ...)
+        with shape (n_windows, max_dim, feature_dim)
     """
     if not windows:
         raise ValueError("Empty windows list")
@@ -464,17 +471,21 @@ def pad_sequence_windows(
     max_triangles = max(w.incidence["n_triangles"] for w in windows)
     
     n_windows = len(windows)
-    n_edge_features = windows[0].edge_features.shape[1] if windows[0].edge_features.size > 0 else 1
-    n_tri_features = windows[0].triangle_features.shape[1] if windows[0].triangle_features.size > 0 else 1
+    node_feat_dim = windows[0].node_features.shape[1] if np.asarray(windows[0].node_features).ndim > 1 else 1
+    n_edge_features = windows[0].edge_features.shape[1] if windows[0].edge_features.size > 0 else node_feat_dim
+    n_tri_features = windows[0].triangle_features.shape[1] if windows[0].triangle_features.size > 0 else node_feat_dim
     
-    node_features_pad = np.full((n_windows, max_nodes), pad_value, dtype=np.float32)
+    node_features_pad = np.full((n_windows, max_nodes, node_feat_dim), pad_value, dtype=np.float32)
     edge_features_pad = np.full((n_windows, max_edges, n_edge_features), pad_value, dtype=np.float32)
     tri_features_pad = np.full((n_windows, max_triangles, n_tri_features), pad_value, dtype=np.float32)
     
     for w_idx, window in enumerate(windows):
         # Pad node features
         n = window.n_nodes
-        node_features_pad[w_idx, :n] = window.node_features
+        node_arr = np.asarray(window.node_features, dtype=np.float32)
+        if node_arr.ndim == 1:
+            node_arr = node_arr[:, None]
+        node_features_pad[w_idx, :n, :node_arr.shape[1]] = node_arr
         
         # Pad edge features
         n_e = window.edge_features.shape[0]

@@ -2,470 +2,465 @@
 """
 Neural network architectures for simplicial complex classification.
 
-Models combine SCCN layers (from TopoModelX) with LSTM layers to handle
-temporal sequences of simplicial complexes.
+These models process one subject at a time. Each subject is represented as a
+sequence of simplicial-complex windows, and the temporal model is applied over
+that single subject sequence before the training loop aggregates losses across
+multiple subjects.
 """
 
+from typing import Any, Dict, List, Optional, Sequence
+
+import numpy as np
 import torch
 import torch.nn as nn
-from typing import Dict, List, Tuple, Optional, Any
-import numpy as np
+
+from topomodelx.nn.simplicial.sccn_layer import SCCNLayer
 
 
-class SCCNLayer(nn.Module):
-    """
-    Simplicial Complex Convolutional Network (SCCN) Layer.
-    
-    Wrapper around TopoModelX SCCN for ease of use. This simplified version
-    implements message passing on simplicial complexes.
-    """
-    
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        max_rank: int = 2,
-        dropout: float = 0.0,
-    ):
-        """
-        Initialize SCCN layer.
-        
-        Args:
-            in_channels: Input feature dimension
-            out_channels: Output feature dimension
-            max_rank: Maximum rank (0=nodes, 1=edges, 2=triangles)
-            dropout: Dropout probability
-        """
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.max_rank = max_rank
-        self.dropout = nn.Dropout(dropout)
-        
-        # Learnable transformations for each rank
-        self.node_lin = nn.Linear(in_channels, out_channels)
-        self.edge_lin = nn.Linear(in_channels, out_channels) if max_rank >= 1 else None
-        self.tri_lin = nn.Linear(in_channels, out_channels) if max_rank >= 2 else None
-        
-        # Message aggregation weights
-        self.node_agg_weight = nn.Parameter(torch.ones(1))
-        self.edge_agg_weight = nn.Parameter(torch.ones(1)) if max_rank >= 1 else None
-        self.tri_agg_weight = nn.Parameter(torch.ones(1)) if max_rank >= 2 else None
-    
-    def forward(
-        self,
-        node_features: torch.Tensor,
-        edge_features: Optional[torch.Tensor] = None,
-        triangle_features: Optional[torch.Tensor] = None,
-        adjacency_dict: Optional[Dict[str, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-        Forward pass through SCCN layer.
-        
-        Args:
-            node_features: Shape (batch_size, n_nodes, in_channels)
-            edge_features: Shape (batch_size, n_edges, in_channels)
-            triangle_features: Shape (batch_size, n_triangles, in_channels)
-            adjacency_dict: Dictionary with adjacency matrices
-        
-        Returns:
-            Tuple of (node_out, edge_out, triangle_out)
-        """
-        # Transform node features
-        node_out = self.node_lin(node_features)
-        node_out = self.dropout(node_out)
-        
-        # Transform edge features (if present)
-        edge_out = None
-        if self.edge_lin is not None and edge_features is not None:
-            edge_out = self.edge_lin(edge_features)
-            edge_out = self.dropout(edge_out)
-        
-        # Transform triangle features (if present)
-        tri_out = None
-        if self.tri_lin is not None and triangle_features is not None:
-            tri_out = self.tri_lin(triangle_features)
-            tri_out = self.dropout(tri_out)
-        
-        return node_out, edge_out, tri_out
+def _as_tensor(value: Any, device: torch.device, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    """Convert a numpy array or tensor to a tensor on the target device."""
+    if isinstance(value, torch.Tensor):
+        return value.to(device=device, dtype=dtype) if dtype is not None else value.to(device=device)
+    return torch.as_tensor(value, device=device, dtype=dtype)
 
 
-class TemporalSimplicialEncoder(nn.Module):
-    """
-    Temporal encoder that applies SCCN layers followed by aggregation.
-    
-    Processes a sequence of simplicial complexes (windows) and produces
-    a fixed-size encoding.
-    """
-    
-    def __init__(
-        self,
-        input_dim: int = 1,
-        hidden_dim: int = 64,
-        num_sccn_layers: int = 2,
-        dropout: float = 0.3,
-        pooling: str = "mean",
-    ):
-        """
-        Initialize temporal encoder.
-        
-        Args:
-            input_dim: Input feature dimension (usually 1 for temporal values)
-            hidden_dim: Hidden feature dimension
-            num_sccn_layers: Number of SCCN layers
-            dropout: Dropout probability
-            pooling: Pooling strategy ('mean', 'max', 'sum')
-        """
-        super().__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.pooling = pooling
-        
-        # Initial embedding
-        self.node_embed = nn.Linear(input_dim, hidden_dim)
-        self.edge_embed = nn.Linear(4, hidden_dim)  # 4 edge features (sum, mean, max, min)
-        self.tri_embed = nn.Linear(4, hidden_dim)  # 4 triangle features
-        
-        # SCCN layers
-        self.sccn_layers = nn.ModuleList([
-            SCCNLayer(
-                in_channels=hidden_dim,
-                out_channels=hidden_dim,
-                max_rank=2,
-                dropout=dropout,
-            )
-            for _ in range(num_sccn_layers)
-        ])
-        
-        # Activation and normalization
-        self.activation = nn.ReLU()
-        self.layer_norm_node = nn.LayerNorm(hidden_dim)
-        self.layer_norm_edge = nn.LayerNorm(hidden_dim)
-        self.layer_norm_tri = nn.LayerNorm(hidden_dim)
-    
-    def forward(
-        self,
-        node_features: torch.Tensor,
-        edge_features: torch.Tensor,
-        triangle_features: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Forward pass through temporal encoder.
-        
-        Args:
-            node_features: Shape (batch_size, seq_len, max_nodes)
-            edge_features: Shape (batch_size, seq_len, max_edges, 4)
-            triangle_features: Shape (batch_size, seq_len, max_triangles, 4)
-        
-        Returns:
-            Encoded features: Shape (batch_size, hidden_dim)
-        """
-        batch_size, seq_len, max_nodes = node_features.shape
-        
-        # Embed features
-        node_feat = self.node_embed(node_features.unsqueeze(-1))  # (batch, seq, nodes, hidden)
-        edge_feat = self.edge_embed(edge_features)  # (batch, seq, edges, hidden)
-        tri_feat = self.tri_embed(triangle_features)  # (batch, seq, triangles, hidden)
-        
-        # Process through SCCN layers
-        for sccn_layer in self.sccn_layers:
-            # Apply SCCN to each window in sequence
-            node_out_list = []
-            edge_out_list = []
-            tri_out_list = []
-            
-            for t in range(seq_len):
-                n_out, e_out, t_out = sccn_layer(
-                    node_feat[:, t],
-                    edge_feat[:, t] if edge_feat.shape[1] > 0 else None,
-                    tri_feat[:, t] if tri_feat.shape[1] > 0 else None,
-                )
-                node_out_list.append(n_out)
-                if e_out is not None:
-                    edge_out_list.append(e_out)
-                if t_out is not None:
-                    tri_out_list.append(t_out)
-            
-            node_feat = torch.stack(node_out_list, dim=1)  # (batch, seq, nodes, hidden)
-            
-            if edge_out_list:
-                edge_feat = torch.stack(edge_out_list, dim=1)
-            if tri_out_list:
-                tri_feat = torch.stack(tri_out_list, dim=1)
-            
-            # Normalize
-            node_feat = self.layer_norm_node(node_feat)
-            if edge_feat.shape[1] > 0:
-                edge_feat = self.layer_norm_edge(edge_feat)
-            if tri_feat.shape[1] > 0:
-                tri_feat = self.layer_norm_tri(tri_feat)
-            
-            # Activation
-            node_feat = self.activation(node_feat)
-            edge_feat = self.activation(edge_feat)
-            tri_feat = self.activation(tri_feat)
-        
-        # Temporal aggregation: pool over time and space
-        # node_feat shape: (batch, seq, nodes, hidden)
-        if self.pooling == "mean":
-            # Average over time and nodes
-            encoded = node_feat.mean(dim=[1, 2])  # (batch, hidden)
-        elif self.pooling == "max":
-            encoded = node_feat.max(dim=1)[0].max(dim=1)[0]  # (batch, hidden)
-        elif self.pooling == "sum":
-            encoded = node_feat.sum(dim=[1, 2])  # (batch, hidden)
+def _rank_features(value: Any, device: torch.device) -> torch.Tensor:
+    """Project raw rank features to a 2D tensor suitable for the linear encoders."""
+    tensor = _as_tensor(value, device=device, dtype=torch.float32)
+    if tensor.ndim == 0:
+        tensor = tensor.view(1, 1)
+    elif tensor.ndim == 1:
+        tensor = tensor.unsqueeze(-1)
+    elif tensor.ndim > 2:
+        tensor = tensor.reshape(-1, tensor.shape[-1])
+    return tensor
+
+
+def _align_feature_dim(tensor: torch.Tensor, target_dim: int) -> torch.Tensor:
+    """Align feature width to target_dim so projections are shape-safe."""
+    if tensor.shape[-1] == target_dim:
+        return tensor
+
+    if target_dim == 1:
+        return tensor.mean(dim=-1, keepdim=True)
+
+    if tensor.shape[-1] > target_dim:
+        return tensor[..., :target_dim]
+
+    pad_width = target_dim - tensor.shape[-1]
+    padding = torch.zeros(*tensor.shape[:-1], pad_width, device=tensor.device, dtype=tensor.dtype)
+    return torch.cat([tensor, padding], dim=-1)
+
+
+def _move_mapping(mapping: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
+    """Move numeric incidence or adjacency payloads to the target device."""
+    moved: Dict[str, Any] = {}
+    for key, value in mapping.items():
+        if isinstance(value, torch.Tensor):
+            moved[key] = value.to(device=device, dtype=torch.float32)
+        elif isinstance(value, np.ndarray):
+            moved[key] = torch.as_tensor(value, device=device, dtype=torch.float32)
         else:
-            raise ValueError(f"Unknown pooling: {self.pooling}")
-        
-        return encoded
+            moved[key] = value
+    return moved
 
 
-class SimplicialLSTMClassifier(nn.Module):
-    """
-    Combine SCCN encoder with LSTM and classification head.
-    
-    Architecture:
-    1. Embed window-level simplicial structures with SCCN
-    2. Process temporal sequence with LSTM
-    3. Classify with MLP head
-    """
-    
-    def __init__(
-        self,
-        input_dim: int = 1,
-        sccn_hidden: int = 64,
-        num_sccn_layers: int = 2,
-        lstm_hidden: int = 128,
-        lstm_layers: int = 1,
-        num_classes: int = 2,
-        dropout: float = 0.3,
-    ):
-        """
-        Initialize classifier.
-        
-        Args:
-            input_dim: Input feature dimension
-            sccn_hidden: SCCN hidden dimension
-            num_sccn_layers: Number of SCCN layers
-            lstm_hidden: LSTM hidden dimension
-            lstm_layers: Number of LSTM layers
-            num_classes: Number of output classes
-            dropout: Dropout probability
-        """
+def _extract_windows(subject_data: Any) -> Sequence[Any]:
+    """Return the list of simplicial windows for a subject sample."""
+    if isinstance(subject_data, dict):
+        if "windows" in subject_data:
+            return subject_data["windows"]
+        if {"features", "incidences", "adjacencies"}.issubset(subject_data):
+            return [subject_data]
+        if {"node_features", "edge_features", "triangle_features"}.issubset(subject_data):
+            return [subject_data]
+    if isinstance(subject_data, (list, tuple)):
+        return subject_data
+    raise TypeError("Subject data must be a dict with 'windows' or a sequence of windows")
+
+
+def _get_rank_mapping(window: Any, attr_name: str, legacy_attr: str) -> Dict[str, Any]:
+    """Return a rank-keyed mapping from a window, with legacy fallback support."""
+    if isinstance(window, dict):
+        mapping = window.get(attr_name)
+    else:
+        mapping = getattr(window, attr_name, None)
+    if isinstance(mapping, dict):
+        return mapping
+
+    if not legacy_attr:
+        return {}
+
+    if isinstance(window, dict):
+        legacy_mapping = window.get(legacy_attr)
+    else:
+        legacy_mapping = getattr(window, legacy_attr, None)
+    if isinstance(legacy_mapping, dict):
+        return legacy_mapping
+
+    return {}
+
+
+def _get_window_rank_features(window: Any) -> Dict[str, Any]:
+    """Extract rank_0/rank_1/rank_2 feature tensors from a window."""
+    features = _get_rank_mapping(window, "features", "")
+    if features:
+        return features
+
+    if isinstance(window, dict):
+        return {
+            "rank_0": window.get("node_features", []),
+            "rank_1": window.get("edge_features", []),
+            "rank_2": window.get("triangle_features", []),
+        }
+
+    return {
+        "rank_0": getattr(window, "node_features", []),
+        "rank_1": getattr(window, "edge_features", []),
+        "rank_2": getattr(window, "triangle_features", []),
+    }
+
+
+def _get_window_rank_incidences(window: Any) -> Dict[str, Any]:
+    """Extract rank_1/rank_2 incidence tensors from a window."""
+    incidences = _get_rank_mapping(window, "incidences", "incidence")
+    if incidences:
+        return incidences
+
+    if isinstance(window, dict):
+        legacy = window.get("incidence", {})
+    else:
+        legacy = getattr(window, "incidence", {}) if hasattr(window, "incidence") else {}
+    return {
+        "rank_1": legacy.get("B1", []),
+        "rank_2": legacy.get("B2", []),
+    }
+
+
+def _get_window_rank_adjacencies(window: Any) -> Dict[str, Any]:
+    """Extract rank_0/rank_1/rank_2 adjacency tensors from a window."""
+    adjacencies = _get_rank_mapping(window, "adjacencies", "adjacency")
+    if adjacencies:
+        return adjacencies
+
+    if isinstance(window, dict):
+        legacy = window.get("adjacency", {})
+    else:
+        legacy = getattr(window, "adjacency", {}) if hasattr(window, "adjacency") else {}
+    return {
+        "rank_0": legacy.get("H0_up", []),
+        "rank_1": legacy.get("H1_down", []),
+        "rank_2": legacy.get("H2_down", []),
+    }
+
+
+class _TemporalSCCNBase(nn.Module):
+    """Shared helpers for the temporal SCCN variants."""
+
+    def __init__(self, in_channel: int, hidden_channels: int, n_layers: int, dropout: float, update_func: str):
         super().__init__()
-        
-        # Temporal simplicial encoder with SCCN
-        self.encoder = TemporalSimplicialEncoder(
-            input_dim=input_dim,
-            hidden_dim=sccn_hidden,
-            num_sccn_layers=num_sccn_layers,
-            dropout=dropout,
-            pooling="mean",
+        self.in_channel = in_channel
+        self.hidden_channels = hidden_channels
+        self.n_layers = n_layers
+
+        self.proj_0 = nn.Sequential(
+            nn.Linear(in_channel, hidden_channels),
+            nn.LayerNorm(hidden_channels),
+            nn.ReLU(),
+            nn.Dropout(dropout),
         )
-        
-        # LSTM for temporal modeling
-        self.lstm = nn.LSTM(
-            input_size=sccn_hidden,
-            hidden_size=lstm_hidden,
-            num_layers=lstm_layers,
+        self.proj_1 = nn.Sequential(
+            nn.Linear(in_channel, hidden_channels),
+            nn.LayerNorm(hidden_channels),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        self.proj_2 = nn.Sequential(
+            nn.Linear(in_channel, hidden_channels),
+            nn.LayerNorm(hidden_channels),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+
+        self.conv_layers = nn.ModuleList(
+            [
+                SCCNLayer(
+                    channels=hidden_channels,
+                    max_rank=2,
+                    update_func=update_func,
+                )
+                for _ in range(n_layers)
+            ]
+        )
+
+    def _build_snapshot(self, window: Any, device: torch.device) -> Dict[str, Any]:
+        rank_features = _get_window_rank_features(window)
+        rank_0 = _align_feature_dim(_rank_features(rank_features.get("rank_0", []), device), self.in_channel)
+        rank_1 = _align_feature_dim(_rank_features(rank_features.get("rank_1", []), device), self.in_channel)
+        rank_2 = _align_feature_dim(_rank_features(rank_features.get("rank_2", []), device), self.in_channel)
+
+        features = {
+            "rank_0": self.proj_0(rank_0),
+            "rank_1": self.proj_1(rank_1),
+            "rank_2": self.proj_2(rank_2),
+        }
+        incidences = _move_mapping(_get_window_rank_incidences(window), device)
+        adjacencies = _move_mapping(_get_window_rank_adjacencies(window), device)
+        return {"features": features, "incidences": incidences, "adjacencies": adjacencies}
+
+    def _apply_sccn_stack(
+        self,
+        features: Dict[str, torch.Tensor],
+        incidences: Dict[str, Any],
+        adjacencies: Dict[str, Any],
+    ) -> Dict[str, torch.Tensor]:
+        if features["rank_0"].numel() == 0:
+            raise ValueError("Subject window has no node features")
+
+        if features["rank_1"].shape[0] == 0 or features["rank_2"].shape[0] == 0:
+            return features
+
+        x_dict = features
+        for layer in self.conv_layers:
+            x_dict = layer(x_dict, incidences, adjacencies)
+        return x_dict
+
+
+class TemporalSCCN_approach1(_TemporalSCCNBase):
+    """SCCN over each window followed by a subject-level LSTM."""
+
+    def __init__(self, in_channel, hidden_channels, out_channels, n_layers=2, dropout=0.3):
+        super().__init__(in_channel, hidden_channels, n_layers, dropout, update_func="relu")
+        self.temporal_lstm = nn.LSTM(hidden_channels, hidden_channels, batch_first=True)
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(hidden_channels),
+            nn.Linear(hidden_channels, out_channels),
+        )
+
+    def forward(self, subject_data):
+        windows = _extract_windows(subject_data)
+        device = next(self.parameters()).device
+
+        temporal_states: List[torch.Tensor] = []
+        for window in windows:
+            snapshot = self._build_snapshot(window, device)
+            x_dict = self._apply_sccn_stack(
+                snapshot["features"], snapshot["incidences"], snapshot["adjacencies"]
+            )
+            temporal_states.append(x_dict["rank_0"].mean(dim=0, keepdim=True))
+
+        if not temporal_states:
+            raise ValueError("No valid temporal snapshots processed")
+
+        seq = torch.stack(temporal_states, dim=1)
+        lstm_out, _ = self.temporal_lstm(seq)
+        subject_repr = lstm_out[:, -1, :]
+        return self.classifier(subject_repr)
+
+
+class TemporalSCCN_approach2(_TemporalSCCNBase):
+    """Interleaved SCCN and LSTM updates across layers."""
+
+    def __init__(self, in_channel, hidden_channels, out_channels, n_layers=2, dropout=0.3):
+        super().__init__(in_channel, hidden_channels, n_layers, dropout, update_func="relu")
+        self.temp_layers = nn.ModuleList(
+            [nn.LSTM(hidden_channels, hidden_channels, batch_first=True) for _ in range(n_layers)]
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_channels * n_layers, hidden_channels),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels, out_channels),
+        )
+
+    def forward(self, subject_data):
+        windows = _extract_windows(subject_data)
+        device = next(self.parameters()).device
+
+        hidden_states: List[Optional[torch.Tensor]] = [None] * self.n_layers
+        cell_states: List[Optional[torch.Tensor]] = [None] * self.n_layers
+
+        for window in windows:
+            snapshot = self._build_snapshot(window, device)
+            x_dict = snapshot["features"]
+            incidences = snapshot["incidences"]
+            adjacencies = snapshot["adjacencies"]
+
+            for layer_idx in range(self.n_layers):
+                x_dict = self.conv_layers[layer_idx](x_dict, incidences, adjacencies)
+                z_0 = x_dict["rank_0"].mean(dim=0, keepdim=True)
+
+                if hidden_states[layer_idx] is None:
+                    hidden_states[layer_idx] = torch.zeros_like(z_0)
+                    cell_states[layer_idx] = torch.zeros_like(z_0)
+
+                _, (h_new, c_new) = self.temp_layers[layer_idx](
+                    z_0.unsqueeze(1),
+                    (hidden_states[layer_idx].unsqueeze(0), cell_states[layer_idx].unsqueeze(0)),
+                )
+                hidden_states[layer_idx] = h_new.squeeze(0)
+                cell_states[layer_idx] = c_new.squeeze(0)
+
+        if any(state is None for state in hidden_states):
+            raise ValueError("No valid temporal snapshots processed")
+
+        subject_repr = torch.cat([state for state in hidden_states if state is not None], dim=1)
+        return self.classifier(subject_repr)
+
+
+class TemporalSCCN_v3(_TemporalSCCNBase):
+    """Subject-level temporal SCCN with per-rank LSTMs and attention."""
+
+    def __init__(self, in_channel, hidden_channels, out_channels, n_layers=2, dropout=0.3):
+        super().__init__(in_channel, hidden_channels, n_layers, dropout, update_func="relu")
+        self.lstm_0 = nn.LSTM(hidden_channels, hidden_channels, batch_first=True)
+        self.lstm_1 = nn.LSTM(hidden_channels, hidden_channels, batch_first=True)
+        self.lstm_2 = nn.LSTM(hidden_channels, hidden_channels, batch_first=True)
+        attention_hidden = max(1, hidden_channels // 4)
+        self.temporal_attention = nn.Sequential(
+            nn.Linear(hidden_channels, attention_hidden),
+            nn.Tanh(),
+            nn.Linear(attention_hidden, 1),
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(3 * hidden_channels, hidden_channels),
+            nn.LayerNorm(hidden_channels),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels // 2, out_channels),
+        )
+
+    def forward(self, subject_data):
+        windows = _extract_windows(subject_data)
+        device = next(self.parameters()).device
+
+        temporal_z0: List[torch.Tensor] = []
+        temporal_z1: List[torch.Tensor] = []
+        temporal_z2: List[torch.Tensor] = []
+
+        for window in windows:
+            snapshot = self._build_snapshot(window, device)
+            x_dict = snapshot["features"]
+            x_dict = self._apply_sccn_stack(x_dict, snapshot["incidences"], snapshot["adjacencies"])
+
+            temporal_z0.append(x_dict["rank_0"].mean(dim=0, keepdim=True))
+            temporal_z1.append(x_dict["rank_1"].mean(dim=0, keepdim=True))
+            temporal_z2.append(x_dict["rank_2"].mean(dim=0, keepdim=True))
+
+        if not temporal_z0:
+            raise ValueError("No valid temporal snapshots processed")
+
+        seq_0 = torch.stack(temporal_z0, dim=1)
+        seq_1 = torch.stack(temporal_z1, dim=1)
+        seq_2 = torch.stack(temporal_z2, dim=1)
+
+        out_0, _ = self.lstm_0(seq_0)
+        out_1, _ = self.lstm_1(seq_1)
+        out_2, _ = self.lstm_2(seq_2)
+
+        attn_scores = self.temporal_attention(out_0.squeeze(0))
+        attn_weights = torch.softmax(attn_scores, dim=0)
+
+        agg_0 = (out_0.squeeze(0) * attn_weights).sum(dim=0, keepdim=True)
+        agg_1 = (out_1.squeeze(0) * attn_weights).sum(dim=0, keepdim=True)
+        agg_2 = (out_2.squeeze(0) * attn_weights).sum(dim=0, keepdim=True)
+
+        fused = torch.cat([agg_0, agg_1, agg_2], dim=1)
+        fused = self.fusion(fused)
+        return self.classifier(fused)
+
+
+class TemporalSCCN_Transformer(_TemporalSCCNBase):
+    """Temporal SCCN using a Transformer encoder over subject windows."""
+
+    def __init__(self, in_channel, hidden_channels, out_channels, n_layers=2, n_heads=4, dropout=0.3):
+        super().__init__(in_channel, hidden_channels, n_layers, dropout, update_func="relu")
+        self.sequence_dim = hidden_channels * 3
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.sequence_dim,
+            nhead=n_heads,
+            dim_feedforward=self.sequence_dim * 2,
+            dropout=dropout,
+            activation="gelu",
             batch_first=True,
-            dropout=dropout if lstm_layers > 1 else 0.0,
         )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
         
-        # Classification head
+        # Properly initialize CLS token and positional encoding
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.sequence_dim))
+        nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
+        
+        self.pos_encoder = nn.Parameter(torch.zeros(1, 512, self.sequence_dim))
+        nn.init.normal_(self.pos_encoder, mean=0.0, std=0.02)
+        
+        # Layer norm before transformer for stable training
+        self.embed_ln = nn.LayerNorm(self.sequence_dim)
+        
         self.classifier = nn.Sequential(
-            nn.Linear(lstm_hidden, lstm_hidden // 2),
-            nn.ReLU(),
+            nn.LayerNorm(self.sequence_dim),
+            nn.Linear(self.sequence_dim, hidden_channels),
+            nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(lstm_hidden // 2, num_classes),
+            nn.Linear(hidden_channels, out_channels),
         )
-    
-    def forward(
-        self,
-        node_features: torch.Tensor,
-        edge_features: torch.Tensor,
-        triangle_features: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Forward pass through classifier.
-        
-        Args:
-            node_features: Shape (batch_size, seq_len, max_nodes)
-            edge_features: Shape (batch_size, seq_len, max_edges, 4)
-            triangle_features: Shape (batch_size, seq_len, max_triangles, 4)
-        
-        Returns:
-            Class logits: Shape (batch_size, num_classes)
-        """
-        batch_size, seq_len, _ = node_features.shape
-        
-        # Encode each window with SCCN
-        encoded_windows = []
-        for t in range(seq_len):
-            enc = self.encoder(
-                node_features[:, t:t+1],
-                edge_features[:, t:t+1],
-                triangle_features[:, t:t+1],
+
+    def forward(self, subject_data):
+        windows = _extract_windows(subject_data)
+        device = next(self.parameters()).device
+
+        temporal_features: List[torch.Tensor] = []
+        for window in windows:
+            snapshot = self._build_snapshot(window, device)
+            x_dict = self._apply_sccn_stack(snapshot["features"], snapshot["incidences"], snapshot["adjacencies"])
+            
+            # Safely handle potentially empty rank features
+            rank_features = []
+            
+            # rank_0 is always present
+            if x_dict["rank_0"].shape[0] > 0:
+                rank_features.append(x_dict["rank_0"].mean(dim=0))
+            else:
+                rank_features.append(torch.zeros(self.hidden_channels, device=device))
+            
+            # rank_1 may be empty
+            if x_dict["rank_1"].shape[0] > 0:
+                rank_features.append(x_dict["rank_1"].mean(dim=0))
+            else:
+                rank_features.append(torch.zeros(self.hidden_channels, device=device))
+            
+            # rank_2 may be empty
+            if x_dict["rank_2"].shape[0] > 0:
+                rank_features.append(x_dict["rank_2"].mean(dim=0))
+            else:
+                rank_features.append(torch.zeros(self.hidden_channels, device=device))
+            
+            temporal_features.append(torch.cat(rank_features, dim=0))
+
+        if not temporal_features:
+            raise ValueError("No valid temporal snapshots processed")
+
+        seq = torch.stack(temporal_features, dim=0).unsqueeze(0)
+        seq_len = seq.size(1) + 1
+        if seq_len > self.pos_encoder.size(1):
+            raise ValueError(
+                f"Sequence length {seq_len} exceeds the maximum positional encoding length {self.pos_encoder.size(1)}"
             )
-            encoded_windows.append(enc)
-        
-        # Stack into sequence
-        encoded_seq = torch.stack(encoded_windows, dim=1)  # (batch, seq_len, sccn_hidden)
-        
-        # Process through LSTM
-        lstm_out, (h_n, c_n) = self.lstm(encoded_seq)  # h_n: (lstm_layers, batch, lstm_hidden)
-        
-        # Take the last hidden state
-        last_hidden = h_n[-1]  # (batch, lstm_hidden)
-        
-        # Classify
-        logits = self.classifier(last_hidden)  # (batch, num_classes)
-        
-        return logits
 
+        cls_tokens = self.cls_token.expand(1, -1, -1)
+        seq = torch.cat([cls_tokens, seq], dim=1)
+        
+        # Add positional encoding and apply layer norm for stability
+        seq = seq + self.pos_encoder[:, :seq_len, :]
+        seq = self.embed_ln(seq)
 
-class SimplePooingClassifier(nn.Module):
-    """
-    Simpler classifier without LSTM, just pooling and MLP.
-    
-    For comparison - treats each window independently and averages.
-    """
-    
-    def __init__(
-        self,
-        input_dim: int = 1,
-        sccn_hidden: int = 64,
-        num_sccn_layers: int = 2,
-        num_classes: int = 2,
-        dropout: float = 0.3,
-    ):
-        """Initialize simple classifier."""
-        super().__init__()
-        
-        self.encoder = TemporalSimplicialEncoder(
-            input_dim=input_dim,
-            hidden_dim=sccn_hidden,
-            num_sccn_layers=num_sccn_layers,
-            dropout=dropout,
-            pooling="mean",
-        )
-        
-        self.classifier = nn.Sequential(
-            nn.Linear(sccn_hidden, sccn_hidden // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(sccn_hidden // 2, num_classes),
-        )
-    
-    def forward(
-        self,
-        node_features: torch.Tensor,
-        edge_features: torch.Tensor,
-        triangle_features: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Forward pass.
-        
-        Args:
-            node_features: Shape (batch_size, seq_len, max_nodes)
-            edge_features: Shape (batch_size, seq_len, max_edges, 4)
-            triangle_features: Shape (batch_size, seq_len, max_triangles, 4)
-        
-        Returns:
-            Class logits: Shape (batch_size, num_classes)
-        """
-        # Encode entire sequence
-        encoded = self.encoder(node_features, edge_features, triangle_features)
-        
-        # Classify
-        logits = self.classifier(encoded)
-        
-        return logits
-
-
-class AttentionPoolingClassifier(nn.Module):
-    """
-    Classifier with attention-based pooling over temporal windows.
-    
-    Uses attention to weight windows and SCCN for encoding.
-    """
-    
-    def __init__(
-        self,
-        input_dim: int = 1,
-        sccn_hidden: int = 64,
-        num_sccn_layers: int = 2,
-        num_classes: int = 2,
-        dropout: float = 0.3,
-    ):
-        """Initialize attention-based classifier."""
-        super().__init__()
-        
-        self.encoder = TemporalSimplicialEncoder(
-            input_dim=input_dim,
-            hidden_dim=sccn_hidden,
-            num_sccn_layers=num_sccn_layers,
-            dropout=dropout,
-            pooling="mean",
-        )
-        
-        # Attention weights for temporal windows
-        self.attention = nn.Sequential(
-            nn.Linear(sccn_hidden, sccn_hidden // 2),
-            nn.ReLU(),
-            nn.Linear(sccn_hidden // 2, 1),
-        )
-        
-        self.classifier = nn.Sequential(
-            nn.Linear(sccn_hidden, sccn_hidden // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(sccn_hidden // 2, num_classes),
-        )
-    
-    def forward(
-        self,
-        node_features: torch.Tensor,
-        edge_features: torch.Tensor,
-        triangle_features: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Forward pass with attention pooling.
-        
-        Args:
-            node_features: Shape (batch_size, seq_len, max_nodes)
-            edge_features: Shape (batch_size, seq_len, max_edges, 4)
-            triangle_features: Shape (batch_size, seq_len, max_triangles, 4)
-        
-        Returns:
-            Class logits: Shape (batch_size, num_classes)
-        """
-        batch_size, seq_len, _ = node_features.shape
-        
-        # Encode each window
-        encoded_windows = []
-        for t in range(seq_len):
-            enc = self.encoder(
-                node_features[:, t:t+1],
-                edge_features[:, t:t+1],
-                triangle_features[:, t:t+1],
-            )
-            encoded_windows.append(enc)
-        
-        # Stack windows
-        encoded_seq = torch.stack(encoded_windows, dim=1)  # (batch, seq_len, sccn_hidden)
-        
-        # Compute attention weights
-        attn_scores = self.attention(encoded_seq)  # (batch, seq_len, 1)
-        attn_weights = torch.softmax(attn_scores, dim=1)  # (batch, seq_len, 1)
-        
-        # Apply attention and pool
-        weighted_sum = (encoded_seq * attn_weights).sum(dim=1)  # (batch, sccn_hidden)
-        
-        # Classify
-        logits = self.classifier(weighted_sum)
-        
-        return logits
+        out = self.transformer(seq)
+        cls_output = out[:, 0, :]
+        return self.classifier(cls_output)
 
 
 def create_model(
@@ -478,46 +473,51 @@ def create_model(
     num_classes: int = 2,
     dropout: float = 0.3,
 ) -> nn.Module:
-    """
-    Factory function to create models.
-    
-    Args:
-        model_name: One of 'SCCN_LSTM', 'SCCN_Pool', 'SCCN_Attention'
-        Other args as model-specific
-    
-    Returns:
-        PyTorch model
-    """
-    if model_name == "SCCN_LSTM":
-        return SimplicialLSTMClassifier(
-            input_dim=input_dim,
-            sccn_hidden=sccn_hidden,
-            num_sccn_layers=num_sccn_layers,
-            lstm_hidden=lstm_hidden,
-            lstm_layers=lstm_layers,
-            num_classes=num_classes,
+    """Factory function to create the requested temporal SCCN model."""
+    aliases = {
+        "SCCN_LSTM": "TemporalSCCN_approach1",
+        "SCCN_Pool": "TemporalSCCN_approach2",
+        "SCCN_Attention": "TemporalSCCN_v3",
+        "SCCN_Transformer": "TemporalSCCN_Transformer",
+    }
+    resolved_name = aliases.get(model_name, model_name)
+
+    if resolved_name == "TemporalSCCN_approach1":
+        return TemporalSCCN_approach1(
+            in_channel=input_dim,
+            hidden_channels=sccn_hidden,
+            out_channels=num_classes,
+            n_layers=num_sccn_layers,
             dropout=dropout,
         )
-    elif model_name == "SCCN_Pool":
-        return SimplePooingClassifier(
-            input_dim=input_dim,
-            sccn_hidden=sccn_hidden,
-            num_sccn_layers=num_sccn_layers,
-            num_classes=num_classes,
+    if resolved_name == "TemporalSCCN_approach2":
+        return TemporalSCCN_approach2(
+            in_channel=input_dim,
+            hidden_channels=sccn_hidden,
+            out_channels=num_classes,
+            n_layers=num_sccn_layers,
             dropout=dropout,
         )
-    elif model_name == "SCCN_Attention":
-        return AttentionPoolingClassifier(
-            input_dim=input_dim,
-            sccn_hidden=sccn_hidden,
-            num_sccn_layers=num_sccn_layers,
-            num_classes=num_classes,
+    if resolved_name == "TemporalSCCN_v3":
+        return TemporalSCCN_v3(
+            in_channel=input_dim,
+            hidden_channels=sccn_hidden,
+            out_channels=num_classes,
+            n_layers=num_sccn_layers,
             dropout=dropout,
         )
-    else:
-        raise ValueError(f"Unknown model: {model_name}")
+    if resolved_name == "TemporalSCCN_Transformer":
+        return TemporalSCCN_Transformer(
+            in_channel=input_dim,
+            hidden_channels=sccn_hidden,
+            out_channels=num_classes,
+            n_layers=num_sccn_layers,
+            dropout=dropout,
+        )
+
+    raise ValueError(f"Unknown model: {model_name}")
 
 
 def count_parameters(model: nn.Module) -> int:
     """Count total trainable parameters."""
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)

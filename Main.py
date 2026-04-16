@@ -6,6 +6,7 @@ Loads configuration, creates dataloaders, trains model, and evaluates.
 """
 
 import argparse
+import copy
 import json
 import logging
 from pathlib import Path
@@ -23,6 +24,42 @@ from tqdm import tqdm
 from Helper import Config, print_config
 from Data_processing import create_dataloaders
 from Network import create_model, count_parameters
+
+
+def _json_default(obj: Any):
+    """Convert common non-JSON-native objects to serializable Python values."""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().tolist()
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, set):
+        return list(obj)
+    raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
+
+def _compact_metadata_for_log(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a compact metadata dict suitable for logging."""
+    compact: Dict[str, Any] = {}
+    for key, value in metadata.items():
+        if key in {"labels", "subject_ids"}:
+            compact[f"{key}_count"] = len(value) if hasattr(value, "__len__") else "n/a"
+            continue
+        if key == "splits" and isinstance(value, dict):
+            compact["split_sizes"] = {
+                split_name: len(split_indices) if hasattr(split_indices, "__len__") else "n/a"
+                for split_name, split_indices in value.items()
+            }
+            continue
+        compact[key] = value
+    return compact
 
 
 def setup_logging(log_dir: Path):
@@ -77,11 +114,12 @@ class ModelTrainer:
         
         # Optimizer and loss
         self.optimizer = optim.Adam(
-            model.parameters(),
+            self.model.parameters(),
             lr=self.lr,
             weight_decay=self.weight_decay,
         )
         self.criterion = nn.CrossEntropyLoss()
+        self.subjects_per_step = max(1, int(config.get("training.batch_size", 1)))
         
         # Learning rate scheduler
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -99,6 +137,7 @@ class ModelTrainer:
         
         self.logger.info(f"Model initialized with {count_parameters(model)} parameters")
         self.logger.info(f"Using device: {device}")
+        self.logger.info(f"Optimizer will step after {self.subjects_per_step} subject(s)")
     
     def train_epoch(self, train_loader) -> Dict[str, float]:
         """
@@ -115,38 +154,40 @@ class ModelTrainer:
         total_loss = 0.0
         all_preds = []
         all_labels = []
+        pending_logits = []
+        pending_labels = []
         
         pbar = tqdm(train_loader, desc="Training")
+        self.optimizer.zero_grad(set_to_none=True)
         
-        for batch_idx, batch in enumerate(pbar):
-            # Move to device
-            node_feat = batch["node_features"].to(self.device)
-            edge_feat = batch["edge_features"].to(self.device)
-            tri_feat = batch["triangle_features"].to(self.device)
-            labels = batch["labels"].to(self.device)
-            
-            # Forward pass
-            self.optimizer.zero_grad()
-            logits = self.model(node_feat, edge_feat, tri_feat)
-            loss = self.criterion(logits, labels)
-            
-            # Backward pass
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
-            
-            # Track metrics
-            total_loss += loss.item()
+        for subject_idx, subject in enumerate(pbar):
+            label = subject["label"].to(self.device).view(1)
+
+            logits = self.model(subject["windows"])
+            pending_logits.append(logits)
+            pending_labels.append(label)
+
             preds = torch.argmax(logits, dim=1).cpu().numpy()
             all_preds.extend(preds)
-            all_labels.extend(labels.cpu().numpy())
-            
-            # Update progress bar
-            pbar.set_postfix({"loss": loss.item()})
-            
-            # Log to tensorboard
-            self.writer.add_scalar("Loss/train", loss.item(), self.global_step)
-            self.global_step += 1
+            all_labels.extend(label.cpu().numpy())
+
+            if len(pending_logits) >= self.subjects_per_step or subject_idx == len(train_loader) - 1:
+                batch_logits = torch.cat(pending_logits, dim=0)
+                batch_labels = torch.cat(pending_labels, dim=0)
+                loss = self.criterion(batch_logits, batch_labels)
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+
+                total_loss += loss.item() * batch_labels.size(0)
+                pbar.set_postfix({"loss": loss.item(), "subjects": batch_labels.size(0)})
+                self.writer.add_scalar("Loss/train", loss.item(), self.global_step)
+                self.global_step += 1
+
+                pending_logits.clear()
+                pending_labels.clear()
         
         # Compute metrics
         avg_loss = total_loss / len(train_loader)
@@ -181,17 +222,11 @@ class ModelTrainer:
             pbar = tqdm(val_loader, desc="Validating")
             
             for batch in pbar:
-                # Move to device
-                node_feat = batch["node_features"].to(self.device)
-                edge_feat = batch["edge_features"].to(self.device)
-                tri_feat = batch["triangle_features"].to(self.device)
-                labels = batch["labels"].to(self.device)
-                
-                # Forward pass
-                logits = self.model(node_feat, edge_feat, tri_feat)
+                labels = batch["label"].to(self.device).view(1)
+
+                logits = self.model(batch["windows"])
                 loss = self.criterion(logits, labels)
-                
-                # Track metrics
+
                 total_loss += loss.item()
                 preds = torch.argmax(logits, dim=1).cpu().numpy()
                 all_preds.extend(preds)
@@ -220,7 +255,7 @@ class ModelTrainer:
         # Track best model
         if accuracy > self.best_val_acc:
             self.best_val_acc = accuracy
-            self.best_model_state = self.model.state_dict().copy()
+            self.best_model_state = copy.deepcopy(self.model.state_dict())
             self.logger.info(f"New best validation accuracy: {accuracy:.4f}")
         
         return metrics
@@ -251,17 +286,11 @@ class ModelTrainer:
             pbar = tqdm(test_loader, desc="Testing")
             
             for batch in pbar:
-                # Move to device
-                node_feat = batch["node_features"].to(self.device)
-                edge_feat = batch["edge_features"].to(self.device)
-                tri_feat = batch["triangle_features"].to(self.device)
-                labels = batch["labels"].to(self.device)
-                
-                # Forward pass
-                logits = self.model(node_feat, edge_feat, tri_feat)
+                labels = batch["label"].to(self.device).view(1)
+
+                logits = self.model(batch["windows"])
                 loss = self.criterion(logits, labels)
-                
-                # Track metrics
+
                 total_loss += loss.item()
                 probs = torch.softmax(logits, dim=1).cpu().numpy()
                 preds = torch.argmax(logits, dim=1).cpu().numpy()
@@ -374,8 +403,17 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="SCCN_LSTM",
-        choices=["SCCN_LSTM", "SCCN_Pool", "SCCN_Attention"],
+        default="TemporalSCCN_v3",
+        choices=[
+            "TemporalSCCN_approach1",
+            "TemporalSCCN_approach2",
+            "TemporalSCCN_v3",
+            "TemporalSCCN_Transformer",
+            "SCCN_LSTM",
+            "SCCN_Pool",
+            "SCCN_Attention",
+            "SCCN_Transformer",
+        ],
         help="Model architecture to use"
     )
     parser.add_argument(
@@ -388,7 +426,7 @@ def main():
         "--batch-size",
         type=int,
         default=32,
-        help="Batch size"
+        help="Number of subjects to accumulate before each optimizer step"
     )
     parser.add_argument(
         "--epochs",
@@ -413,6 +451,13 @@ def main():
         default=42,
         help="Random seed"
     )
+    parser.add_argument(
+        "--sindy-backend",
+        type=str,
+        default="faster_sindy",
+        choices=["faster_sindy", "sindy"],
+        help="SINDy backend to use for preprocessing"
+    )
     
     args = parser.parse_args()
     
@@ -435,6 +480,8 @@ def main():
         config.config["training"]["num_epochs"] = args.epochs
     if args.lr:
         config.config["training"]["learning_rate"] = args.lr
+    if args.sindy_backend:
+        config.config.setdefault("processing", {})["sindy_backend"] = args.sindy_backend
     
     config.config["training"]["random_seed"] = args.seed
     
@@ -477,21 +524,22 @@ def main():
             n_subjects=config.get("dataset.n_subjects"),
             window_length=window_length,
             window_overlap=config.get("processing.window_overlap", 0.25),
-            batch_size=config.get("training.batch_size", 32),
+            batch_size=1,
             train_split=config.get("training.train_split", 0.7),
             val_split=config.get("training.val_split", 0.15),
             test_split=config.get("training.test_split", 0.15),
             random_seed=args.seed,
             verbose=config.get("logging.verbose", True),
             upsample_factor=upsample_factor,
+            sindy_backend=config.get("processing.sindy_backend", "faster_sindy"),
         )
         
-        logger.info(f"Metadata: {metadata}")
+        logger.info(f"Metadata: {_compact_metadata_for_log(metadata)}")
         
         # Create model
         logger.info(f"Creating model: {config.get('model.name')}")
         model = create_model(
-            model_name=config.get("model.name", "SCCN_LSTM"),
+            model_name=config.get("model.name", "TemporalSCCN_v3"),
             input_dim=1,
             sccn_hidden=config.get("model.sccn_hidden", 64),
             num_sccn_layers=config.get("model.sccn_layers", 2),
@@ -531,7 +579,7 @@ def main():
         }
         
         with open(results_file, "w") as f:
-            json.dump(results, f, indent=2)
+            json.dump(results, f, indent=2, default=_json_default)
         
         logger.info(f"Results saved to {results_file}")
         
