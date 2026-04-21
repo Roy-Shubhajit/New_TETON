@@ -1,7 +1,7 @@
 import os
 import math
 from itertools import combinations
-from tqdm import tqdm
+from tqdm.auto import tqdm
 import numpy as np
 import pandas as pd
 from scipy.signal import savgol_filter
@@ -514,8 +514,32 @@ def process_data_in_windows(data, args):
     
     results = []
 
-    # Iterate continuously over sliding windows
-    for window_index, w_start in enumerate(range(0, T_len - args.win_len + 1, stride)):
+    # Iterate continuously over sliding windows.
+    # Use notebook-aware tqdm and keep nested bars visible in notebook UIs.
+    window_starts = list(range(0, T_len - args.win_len + 1, stride))
+    show_window_progress = bool(getattr(args, "show_window_progress", True))
+    disable_window_tqdm = bool(getattr(args, "disable_window_tqdm", False)) or (not show_window_progress)
+    use_notebook_tqdm = bool(getattr(args, "use_notebook_tqdm", True))
+    tqdm_cls = tqdm
+    if use_notebook_tqdm:
+        try:
+            from tqdm.notebook import tqdm as notebook_tqdm
+            tqdm_cls = notebook_tqdm
+        except Exception:
+            tqdm_cls = tqdm
+    window_iter = enumerate(
+        tqdm_cls(
+            window_starts,
+            total=len(window_starts),
+            desc="sindy windows",
+            leave=True,
+            position=1,
+            dynamic_ncols=True,
+            mininterval=0.2,
+            disable=disable_window_tqdm,
+        )
+    )
+    for window_index, w_start in window_iter:
         w_end = w_start + args.win_len
         
         # 1. WINDOW DEPENDENT SLICING
@@ -688,12 +712,14 @@ def process_data_in_windows(data, args):
                 else:
                     Xi_deb[~active_mask, :] = 0.0
 
-                Xi_deb = enforce_simplicial_hierarchy_clean(
-                    Xi_deb,
-                    maps0,
-                    gpu_available=GPU_AVAILABLE,
-                    cp_module=cp if GPU_AVAILABLE else None,
-                )
+                enforce_hierarchy = bool(getattr(args, "enforce_hierarchy", True))
+                if enforce_hierarchy:
+                    Xi_deb = enforce_simplicial_hierarchy_clean(
+                        Xi_deb,
+                        maps0,
+                        gpu_available=GPU_AVAILABLE,
+                        cp_module=cp if GPU_AVAILABLE else None,
+                    )
 
             Xi_gpu = Xi_deb
 
