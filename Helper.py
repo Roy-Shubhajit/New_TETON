@@ -38,8 +38,8 @@ class Config:
             },
             # Processing settings
             "processing": {
-                "upsample_factor": 100,
-                "window_length_base": 10,
+                "upsample_factor": 1,
+                "window_length_base": 1024,
                 "window_overlap": 0.25,
                 "d_max": 2,
                 "tau2_q": 0.8,

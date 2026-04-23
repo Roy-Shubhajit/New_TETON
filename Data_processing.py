@@ -33,6 +33,14 @@ from Helper import (
 FAST_CACHE_FILENAME = "processed_cache.pkl"
 
 
+def _normalized_dataset_name(dataset_name: str) -> str:
+    """Normalize dataset name used in cache/export paths."""
+    dataset = str(dataset_name).strip().lower()
+    if dataset not in {"abide", "deap"}:
+        raise ValueError("dataset_name must be either 'abide' or 'deap'")
+    return dataset
+
+
 def _normalized_backend_name(sindy_backend: str) -> str:
     """Normalize the backend name used to separate exported datasets."""
     backend = str(sindy_backend).strip().lower()
@@ -46,6 +54,87 @@ def _processed_backend_dir(output_dir: str, sindy_backend: str) -> Path:
     return Path(output_dir) / _normalized_backend_name(sindy_backend)
 
 
+def _processed_dataset_backend_dir(output_dir: str, dataset_name: str, sindy_backend: str) -> Path:
+    """Return dataset+backend specific export directory."""
+    return Path(output_dir) / _normalized_dataset_name(dataset_name) / _normalized_backend_name(sindy_backend)
+
+
+def _to_numpy_2d_eeg(values: Any) -> np.ndarray:
+    """Convert DEAP sample tensor/array to [timepoints, channels] float array."""
+    if hasattr(values, "detach"):
+        arr = values.detach().cpu().numpy()
+    else:
+        arr = np.asarray(values)
+
+    if arr.ndim == 3 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim != 2:
+        arr = np.squeeze(arr)
+    if arr.ndim != 2:
+        raise ValueError(f"Unsupported DEAP EEG shape after squeeze: {arr.shape}")
+
+    # Favor [T, C] where EEG channel count is typically <= 64.
+    if arr.shape[0] <= 64 and arr.shape[1] > 64:
+        arr = arr.T
+    elif arr.shape[1] <= 64 and arr.shape[0] > 64:
+        arr = arr
+    else:
+        arr = arr.T if arr.shape[0] <= 64 else arr
+    return np.asarray(arr, dtype=np.float64)
+
+
+def _parse_deap_sample(sample: Any) -> Tuple[Any, Any]:
+    """Extract (eeg, label) from common TorchEEG DEAP sample variants."""
+    if isinstance(sample, dict):
+        eeg = sample.get("eeg", sample.get("signal", None))
+        label = sample.get("label", sample.get("y", None))
+        if eeg is None or label is None:
+            raise RuntimeError(f"Unsupported DEAP dict sample keys: {list(sample.keys())}")
+        return eeg, label
+
+    if isinstance(sample, (tuple, list)):
+        if len(sample) == 0:
+            raise RuntimeError("Empty DEAP sample")
+        if len(sample) == 1:
+            return _parse_deap_sample(sample[0])
+        if len(sample) >= 3:
+            return sample[0], sample[2]
+        first, second = sample[0], sample[1]
+        if isinstance(first, (tuple, list)) and len(first) >= 1:
+            eeg = first[0]
+            return eeg, second
+        if isinstance(first, dict):
+            eeg = first.get("eeg", first.get("signal", None))
+            if eeg is not None:
+                return eeg, second
+        return first, second
+
+    raise RuntimeError(f"Unsupported DEAP sample type: {type(sample)}")
+
+
+def _deap_label_value(label: Any, target: str) -> float:
+    """Extract scalar target score from DEAP label payload."""
+    if hasattr(label, "detach"):
+        arr = label.detach().cpu().numpy()
+    else:
+        arr = np.asarray(label)
+    arr = np.asarray(arr, dtype=np.float64).reshape(-1)
+
+    target_to_idx = {
+        "valence": 0,
+        "arousal": 1,
+        "dominance": 2,
+        "liking": 3,
+    }
+    key = str(target).strip().lower()
+    if key not in target_to_idx:
+        raise ValueError("deap_label_target must be one of: valence, arousal, dominance, liking")
+    idx = target_to_idx[key]
+    if arr.size <= idx:
+        raise ValueError(f"DEAP label has size {arr.size}, cannot read index {idx} for {key}")
+    return float(arr[idx])
+
+
 @dataclass
 class _WindowBackendResult:
     """Backend-agnostic minimal window payload used by process_subject."""
@@ -54,6 +143,8 @@ class _WindowBackendResult:
     end: int
     pred_edges: set
     pred_tris: set
+    edge_score: Optional[Dict] = None
+    triangle_score: Optional[Dict] = None
 
 
 def _sort_edges(edge_list: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
@@ -63,8 +154,10 @@ def _sort_edges(edge_list: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
 
 def construct_topological_snapshot(
     node_features: np.ndarray,
-    edge_list: List[Tuple[int, int]],
-    triangle_list: List[Tuple[int, int, int]],
+    edge_list: List[Any],
+    triangle_list: List[Any],
+    edge_score: Optional[Any] = None,
+    triangle_score: Optional[Any] = None,
     agg_func: str = "mean",
 ) -> Tuple[Dict[int, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray], List[Tuple[int, int]], List[Tuple[int, int, int]]]:
     """Construct lifted features, incidence matrices, and adjacency matrices for one window."""
@@ -75,8 +168,6 @@ def construct_topological_snapshot(
         raise ValueError(f"node_features must be 1D or 2D, got shape {x0.shape}")
 
     n_nodes, feat_dim = x0.shape
-    edges = _sort_edges(edge_list)
-    edge_to_idx = {edge: idx for idx, edge in enumerate(edges)}
 
     def _aggregate(values: np.ndarray) -> np.ndarray:
         if agg_func == "mean":
@@ -87,8 +178,110 @@ def construct_topological_snapshot(
             return values.max(axis=0)
         raise ValueError("agg_func must be 'mean', 'sum', or 'max'")
 
+    def _parse_edge_item(item: Any) -> Tuple[int, int]:
+        # Supported forms for backward compatibility:
+        # - (u, v)
+        # - (u, v, score)
+        # - ((u, v), score)
+        if not isinstance(item, (tuple, list)):
+            raise ValueError(f"Invalid edge specification: {item}")
+        if len(item) == 2 and isinstance(item[0], (tuple, list)) and len(item[0]) == 2:
+            u, v = int(item[0][0]), int(item[0][1])
+            return tuple(sorted((u, v)))
+        if len(item) >= 2:
+            u, v = int(item[0]), int(item[1])
+            return tuple(sorted((u, v)))
+        raise ValueError(f"Invalid edge specification: {item}")
+
+    def _parse_triangle_item(item: Any) -> Tuple[int, int, int]:
+        # Supported forms for backward compatibility:
+        # - (u, v, w)
+        # - (u, v, w, score)
+        # - ((u, v, w), score)
+        if not isinstance(item, (tuple, list)):
+            raise ValueError(f"Invalid triangle specification: {item}")
+        if len(item) == 2 and isinstance(item[0], (tuple, list)) and len(item[0]) == 3:
+            u, v, w = int(item[0][0]), int(item[0][1]), int(item[0][2])
+            return tuple(sorted((u, v, w)))
+        if len(item) >= 3:
+            u, v, w = int(item[0]), int(item[1]), int(item[2])
+            return tuple(sorted((u, v, w)))
+        raise ValueError(f"Invalid triangle specification: {item}")
+
+    edges = sorted({_parse_edge_item(edge_item) for edge_item in edge_list})
+    triangles_all = sorted({_parse_triangle_item(tri_item) for tri_item in triangle_list})
+
+    def _normalize_simplex_score_input(
+        simplices: List[Any],
+        scores: Any,
+        simplex_name: str,
+    ) -> Dict[Any, float]:
+        if scores is None:
+            return {}
+
+        if isinstance(scores, dict):
+            out: Dict[Any, float] = {}
+            for key, value in scores.items():
+                if simplex_name == "edge":
+                    if not isinstance(key, (tuple, list)) or len(key) != 2:
+                        raise ValueError(f"{simplex_name}_score dict keys must be 2-tuples")
+                    parsed_key = tuple(sorted((int(key[0]), int(key[1]))))
+                else:
+                    if not isinstance(key, (tuple, list)) or len(key) != 3:
+                        raise ValueError(f"{simplex_name}_score dict keys must be 3-tuples")
+                    parsed_key = tuple(sorted((int(key[0]), int(key[1]), int(key[2]))))
+                out[parsed_key] = float(value)
+            return out
+
+        if isinstance(scores, (list, tuple, np.ndarray)):
+            if len(scores) != len(simplices):
+                raise ValueError(
+                    f"{simplex_name}_score length ({len(scores)}) must match "
+                    f"{simplex_name}_list length ({len(simplices)})"
+                )
+            out = {}
+            for item, value in zip(simplices, scores):
+                key = _parse_edge_item(item) if simplex_name == "edge" else _parse_triangle_item(item)
+                out[key] = max(out.get(key, float("-inf")), float(value))
+            return out
+
+        raise ValueError(
+            f"{simplex_name}_score must be None, a dict, or a sequence aligned with {simplex_name}_list"
+        )
+
+    edge_score_map: Dict[Tuple[int, int], float] = {edge: 1.0 for edge in edges}
+    provided_edge_scores = _normalize_simplex_score_input(edge_list, edge_score, "edge")
+    if provided_edge_scores:
+        for e in edges:
+            if e in provided_edge_scores:
+                edge_score_map[e] = provided_edge_scores[e]
+
+    tri_score_map: Dict[Tuple[int, int, int], float] = {tri: 1.0 for tri in triangles_all}
+    provided_triangle_scores = _normalize_simplex_score_input(triangle_list, triangle_score, "triangle")
+
+    if provided_triangle_scores:
+        for tri in triangles_all:
+            if tri in provided_triangle_scores:
+                tri_score_map[tri] = provided_triangle_scores[tri]
+    elif provided_edge_scores:
+        for tri in triangles_all:
+            u, v, w = tri
+            e1 = tuple(sorted((u, v)))
+            e2 = tuple(sorted((v, w)))
+            e3 = tuple(sorted((u, w)))
+            edge_vals = np.asarray(
+                [edge_score_map.get(e1, 1.0), edge_score_map.get(e2, 1.0), edge_score_map.get(e3, 1.0)],
+                dtype=np.float32,
+            )
+            tri_score_map[tri] = float(_aggregate(edge_vals))
+
+    edge_to_idx = {edge: idx for idx, edge in enumerate(edges)}
+
     if edges:
-        x1 = np.stack([_aggregate(x0[[u, v]]) for (u, v) in edges], axis=0).astype(np.float32)
+        x1 = np.stack(
+            [edge_score_map[(u, v)] * _aggregate(x0[[u, v]]) for (u, v) in edges],
+            axis=0,
+        ).astype(np.float32)
     else:
         x1 = np.zeros((0, feat_dim), dtype=np.float32)
 
@@ -101,8 +294,8 @@ def construct_topological_snapshot(
 
     # Keep only triangles whose edges exist in edge_list.
     valid_triangles: List[Tuple[int, int, int]] = []
-    for tri in triangle_list:
-        u, v, w = sorted((int(tri[0]), int(tri[1]), int(tri[2])))
+    for tri in tri_score_map.keys():
+        u, v, w = tri
         e1 = tuple(sorted((u, v)))
         e2 = tuple(sorted((v, w)))
         e3 = tuple(sorted((u, w)))
@@ -117,7 +310,10 @@ def construct_topological_snapshot(
         B2[edge_to_idx[tuple(sorted((u, w)))], t_idx] = 1.0
 
     if valid_triangles:
-        x2 = np.stack([_aggregate(x0[[u, v, w]]) for (u, v, w) in valid_triangles], axis=0).astype(np.float32)
+        x2 = np.stack(
+            [tri_score_map[(u, v, w)] * _aggregate(x0[[u, v, w]]) for (u, v, w) in valid_triangles],
+            axis=0,
+        ).astype(np.float32)
     else:
         x2 = np.zeros((0, feat_dim), dtype=np.float32)
 
@@ -220,10 +416,12 @@ def save_processed_dataset(
     metadata: Dict[str, Any],
     output_dir: str,
     sindy_backend: str,
+    dataset_name: str = "abide",
 ) -> Dict[str, Any]:
     """Save processed simplicial dataset so others can reuse it without recomputation."""
     backend_name = _normalized_backend_name(sindy_backend)
-    out_dir = _processed_backend_dir(output_dir, backend_name)
+    dataset_name = _normalized_dataset_name(dataset_name)
+    out_dir = _processed_dataset_backend_dir(output_dir, dataset_name, backend_name)
     subjects_dir = out_dir / "subjects"
     fast_cache_path = out_dir / FAST_CACHE_FILENAME
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -385,6 +583,7 @@ def load_processed_dataset(
     output_dir: str,
     sindy_backend: str,
     allow_npz_fallback: bool = False,
+    dataset_name: str = "abide",
 ) -> Tuple[List[Dict[str, Any]], List[int], Dict[str, List[int]], Dict[str, Any]]:
     """Load previously processed simplicial dataset export from disk.
 
@@ -392,7 +591,8 @@ def load_processed_dataset(
     loading is available only when allow_npz_fallback=True.
     """
     backend_name = _normalized_backend_name(sindy_backend)
-    out_dir = _processed_backend_dir(output_dir, backend_name)
+    dataset_name = _normalized_dataset_name(dataset_name)
+    out_dir = _processed_dataset_backend_dir(output_dir, dataset_name, backend_name)
     fast_cache_path = out_dir / FAST_CACHE_FILENAME
     manifest_path = out_dir / "manifest.json"
 
@@ -652,7 +852,7 @@ class ABIDESimplicialProcessor:
         self,
         data_dir: str = "./",
         save_intermediates: bool = False,
-        upsample_factor: int = 100,
+        upsample_factor: int = 1,
         sindy_backend: str = "faster_sindy",
     ):
         """
@@ -665,14 +865,19 @@ class ABIDESimplicialProcessor:
         """
         self.data_dir = Path(data_dir)
         self.save_intermediates = save_intermediates
-        self.upsample_factor = upsample_factor
+        self.upsample_factor = int(upsample_factor) if upsample_factor is not None else 1
+        if self.upsample_factor < 1:
+            raise ValueError("upsample_factor must be >= 1")
         self.sindy_backend = str(sindy_backend).strip().lower()
         if self.sindy_backend not in {"faster_sindy", "sindy"}:
             raise ValueError("sindy_backend must be either 'faster_sindy' or 'sindy'")
+
+        base_fs = 256.0
+        effective_fs = base_fs * float(self.upsample_factor) if self.upsample_factor > 1 else base_fs
         
         # Create config objects for processing
         self.preprocess_cfg = PreprocessConfig(
-            fs=256.0,
+            fs=effective_fs,
             win_sg=29,
             poly_order=3,
         )
@@ -717,12 +922,27 @@ class ABIDESimplicialProcessor:
                 solver_cfg=self.solver_cfg,
                 threshold_cfg=self.threshold_cfg,
             )
+
+            def _norm_edge_score_map(scores: Optional[Dict[Any, Any]]) -> Dict[Tuple[int, int], float]:
+                if not scores:
+                    return {}
+                out: Dict[Tuple[int, int], float] = {}
+                for key, value in scores.items():
+                    key_list = list(key) if isinstance(key, (set, frozenset)) else list(key)
+                    if len(key_list) != 2:
+                        continue
+                    u, v = int(key_list[0]), int(key_list[1])
+                    out[tuple(sorted((u, v)))] = float(value)
+                return out
+
             return [
                 _WindowBackendResult(
                     start=int(r.start),
                     end=int(r.end),
                     pred_edges={frozenset(tuple(sorted(tuple(e)))) for e in r.pred_edges},
                     pred_tris={frozenset(tuple(sorted(tuple(t)))) for t in r.pred_tris},
+                    edge_score=_norm_edge_score_map(r.edge_scores),
+                    triangle_score=None,
                 )
                 for r in backend_results
             ]
@@ -756,6 +976,8 @@ class ABIDESimplicialProcessor:
                     end=int(r.get("window_end", 0)),
                     pred_edges={frozenset(tuple(sorted(tuple(e)))) for e in raw_edges},
                     pred_tris={frozenset(tuple(sorted(tuple(t)))) for t in raw_tris},
+                    edge_score=None,
+                    triangle_score=None,
                 )
             )
         return out
@@ -770,7 +992,7 @@ class ABIDESimplicialProcessor:
         """
         Process a single subject timeseries into windows of simplicial complexes.
         
-        Args:
+        Args
             subject_ts: Time series of shape (timepoints, rois)
             window_len: Length of each window
             window_overlap: Overlap between windows
@@ -818,10 +1040,15 @@ class ABIDESimplicialProcessor:
                     edges_in = [tuple(sorted(tuple(edge))) for edge in result.pred_edges]
                     triangles_in = [tuple(sorted(tuple(tri))) for tri in result.pred_tris]
 
+                    
+                    triangle_score = result.triangle_score if hasattr(result, "triangle_score") else None
+
                     features, incidences, adjacencies, edges, triangles = construct_topological_snapshot(
                         node_features=node_temporal,
                         edge_list=edges_in,
                         triangle_list=triangles_in,
+                        edge_score=result.edge_score,
+                        triangle_score=triangle_score,
                         agg_func="mean",
                     )
 
@@ -911,13 +1138,12 @@ class ABIDESimplicialProcessor:
             Tuple of (samples, labels, subject_ids)
         """
         
-        samples = []
-        labels = []
-        subject_ids_list = []
-        
         # Get all timeseries
         all_timeseries = abide_data.rois_cc200
         phenotypic_data = abide_data.phenotypic
+        series_list: List[np.ndarray] = []
+        labels: List[int] = []
+        subject_ids_list: List[str] = []
         
         print(f"Processing {len(all_timeseries)} subjects...")
         
@@ -945,21 +1171,60 @@ class ABIDESimplicialProcessor:
                 continue
             
             # Process subject
+            series_list.append(np.asarray(subject_ts, dtype=np.float64))
+            labels.append(int(label))
+            subject_ids_list.append(str(subject_id))
+
+        samples, labels_out, subject_ids_out = self.process_samples(
+            timeseries_list=series_list,
+            labels=labels,
+            subject_ids=subject_ids_list,
+            window_len=window_len,
+            window_overlap=window_overlap,
+            desc="ABIDE Subjects",
+        )
+        print(f"Processed {len(samples)} subjects successfully")
+        return samples, labels_out, subject_ids_out
+
+    def process_samples(
+        self,
+        timeseries_list: List[np.ndarray],
+        labels: List[int],
+        subject_ids: List[str],
+        window_len: int,
+        window_overlap: float,
+        desc: str = "Samples",
+    ) -> Tuple[List[Dict[str, Any]], List[int], List[str]]:
+        """Process any labeled timeseries list into simplicial samples."""
+        if not (len(timeseries_list) == len(labels) == len(subject_ids)):
+            raise ValueError("timeseries_list, labels, and subject_ids must have equal length")
+
+        samples: List[Dict[str, Any]] = []
+        labels_out: List[int] = []
+        subject_ids_out: List[str] = []
+
+        iterator = tqdm(range(len(timeseries_list)), desc=desc) if len(timeseries_list) > 1 else range(len(timeseries_list))
+        for i in iterator:
+            subject_ts = np.asarray(timeseries_list[i], dtype=np.float64)
+            label = int(labels[i])
+            subject_id = str(subject_ids[i])
+
+            if subject_ts.ndim != 2:
+                print(f"  [skip] Subject {subject_id}: invalid shape {subject_ts.shape}")
+                continue
+
             result = self.process_subject(
                 subject_ts,
                 window_len=window_len,
                 window_overlap=window_overlap,
                 subject_id=subject_id,
             )
-            
-            # Add to dataset if successful
             if result.get("windows"):
                 samples.append(result)
-                labels.append(label)
-                subject_ids_list.append(subject_id)
-        
-        print(f"Processed {len(samples)} subjects successfully")
-        return samples, labels, subject_ids_list
+                labels_out.append(label)
+                subject_ids_out.append(subject_id)
+
+        return samples, labels_out, subject_ids_out
     
     @staticmethod
     def _get_subject_id(abide_data, index: int) -> str:
@@ -977,8 +1242,103 @@ class ABIDESimplicialProcessor:
         return f"subject_{index:04d}"
 
 
+def load_deap_samples(
+    data_dir: str,
+    n_subjects: Optional[int],
+    io_path: Optional[str],
+    label_target: str,
+    label_threshold: float,
+    verbose: bool,
+) -> Tuple[List[np.ndarray], List[int], List[str], Dict[str, Any]]:
+    """Load DEAP samples and convert to binary labels for pipeline use."""
+    try:
+        from torcheeg.datasets import DEAPDataset
+        from torcheeg import transforms
+    except Exception as exc:
+        raise RuntimeError(
+            "DEAP pipeline requires torcheeg. Install it first (see notebook setup)."
+        ) from exc
+
+    data_root = Path(data_dir)
+    if not data_root.exists():
+        raise FileNotFoundError(f"DEAP data_dir does not exist: {data_root}")
+
+    if io_path is None:
+        io_path = str(data_root.parent / "io_cache")
+
+    label_target = str(label_target).strip().lower()
+    if label_target not in {"valence", "arousal", "dominance", "liking"}:
+        raise ValueError("deap_label_target must be one of: valence, arousal, dominance, liking")
+
+    label_tf = transforms.Compose([
+        transforms.Select(["valence", "arousal", "dominance", "liking"]),
+    ])
+
+    if verbose:
+        print(f"Loading DEAP dataset from {data_root}...")
+
+    dataset = DEAPDataset(
+        root_path=str(data_root),
+        overlap=0,
+        num_worker=0,
+        io_path=str(io_path),
+        io_mode="pickle",
+        online_transform=None,
+        offline_transform=None,
+        label_transform=label_tf,
+        verbose=verbose,
+    )
+
+    n_total = len(dataset)
+    n_fetch = n_total if n_subjects is None else min(int(n_subjects), n_total)
+
+    timeseries_list: List[np.ndarray] = []
+    labels: List[int] = []
+    subject_ids: List[str] = []
+    high_count = 0
+    low_count = 0
+
+    iterator = range(n_fetch)
+    if verbose and n_fetch > 1:
+        iterator = tqdm(iterator, desc="DEAP Samples")
+
+    for i in iterator:
+        sample = dataset[i]
+        eeg, label = _parse_deap_sample(sample)
+        ts = _to_numpy_2d_eeg(eeg)
+        target_value = _deap_label_value(label, label_target)
+        y = 1 if float(target_value) >= float(label_threshold) else 0
+
+        if y == 1:
+            high_count += 1
+        else:
+            low_count += 1
+
+        timeseries_list.append(ts)
+        subject_ids.append(f"deap_sample_{i:05d}")
+        labels.append(int(y))
+
+    if not timeseries_list:
+        raise RuntimeError("No DEAP samples were loaded")
+
+    deap_meta = {
+        "dataset_name": "deap",
+        "deap_label_target": label_target,
+        "deap_label_threshold": float(label_threshold),
+        "deap_class_counts": {
+            "low": int(low_count),
+            "high": int(high_count),
+        },
+        "deap_io_path": str(io_path),
+        "deap_total_samples": int(n_total),
+        "deap_loaded_samples": int(len(timeseries_list)),
+    }
+    return timeseries_list, labels, subject_ids, deap_meta
+
+
 def create_dataloaders(
     data_dir: str = "./",
+    dataset_name: str = "abide",
     n_subjects: Optional[int] = None,
     window_length: int = 1024,  # scaled by upsample factor
     window_overlap: float = 0.5,
@@ -992,14 +1352,18 @@ def create_dataloaders(
     save_processed: bool = True,
     processed_output_dir: str = "./abide_simplicial_dataset",
     load_processed_if_available: bool = True,
-    upsample_factor: int = 100,
+    upsample_factor: int = 1,
     sindy_backend: str = "faster_sindy",
+    deap_io_path: Optional[str] = None,
+    deap_label_target: str = "valence",
+    deap_label_threshold: float = 5.0,
 ) -> Tuple[DataLoader, DataLoader, DataLoader, Dict[str, Any]]:
     """
-    Create train, validation, and test dataloaders for ABIDE data.
+    Create train, validation, and test dataloaders for ABIDE or DEAP data.
     
     Args:
-        data_dir: Path to ABIDE dataset
+        data_dir: Path to dataset root
+        dataset_name: Dataset selector ('abide' or 'deap')
         n_subjects: Number of subjects to process (None for all)
         window_length: Length of each processing window
         window_overlap: Overlap between windows
@@ -1013,8 +1377,11 @@ def create_dataloaders(
         save_processed: Whether to export processed dataset cache to disk
         processed_output_dir: Directory where processed dataset export is written
         load_processed_if_available: If True, reuse existing processed export when present
-        upsample_factor: Interpolation factor for upsampling timeseries
+        upsample_factor: Interpolation factor for upsampling timeseries (1 disables upsampling)
         sindy_backend: Backend solver to use, either 'faster_sindy' or 'sindy'
+        deap_io_path: Optional TorchEEG cache path for DEAP
+        deap_label_target: DEAP label dimension to binarize
+        deap_label_threshold: Threshold for DEAP binary label
     
     Returns:
         Tuple of (train_loader, val_loader, test_loader, metadata_dict)
@@ -1024,6 +1391,14 @@ def create_dataloaders(
     total = train_split + val_split + test_split
     if abs(total - 1.0) > 1e-6:
         raise ValueError(f"Splits must sum to 1.0, got {total}")
+
+    dataset_name = _normalized_dataset_name(dataset_name)
+
+    if verbose:
+        print(
+            f"Window config -> length: {int(window_length)}, overlap: {float(window_overlap):.3f}, "
+            f"upsample_factor: {int(upsample_factor)}"
+        )
     
     # Set random seed
     torch.manual_seed(random_seed)
@@ -1041,13 +1416,14 @@ def create_dataloaders(
     processed_loaded = False
     split_indices: Dict[str, List[int]] = {}
     loaded_metadata: Dict[str, Any] = {}
-    processed_backend_dir = _processed_backend_dir(processed_output_dir, sindy_backend)
+    processed_backend_dir = _processed_dataset_backend_dir(processed_output_dir, dataset_name, sindy_backend)
 
     if load_processed_if_available:
         try:
             samples, labels, split_indices, loaded_metadata = load_processed_dataset(
                 processed_output_dir,
                 sindy_backend=sindy_backend,
+                dataset_name=dataset_name,
             )
             subject_ids = [str(sample.get("subject_id", "unknown")) for sample in samples]
             loaded_backend = (
@@ -1074,36 +1450,61 @@ def create_dataloaders(
                 print(f"Could not load processed dataset ({e}). Running processing...")
 
     if not processed_loaded:
-        # Load ABIDE dataset
-        if verbose:
-            print(f"Loading ABIDE dataset from {data_dir}...")
-
-        try:
-            from nilearn import datasets
-            abide_data = datasets.fetch_abide_pcp(
-                data_dir=data_dir,
-                derivatives="rois_cc200",
-                n_subjects=n_subjects,
-                verbose=1 if verbose else 0,
-            )
-        except Exception as e:
-            raise RuntimeError(f"Failed to load ABIDE dataset: {e}")
-
-        # Process dataset
-        if verbose:
-            print("Processing dataset into simplicial complexes (CPU preprocessing)...")
-
         processor = ABIDESimplicialProcessor(
             data_dir=data_dir,
             save_intermediates=False,
             upsample_factor=upsample_factor,
             sindy_backend=sindy_backend,
         )
-        samples, labels, subject_ids = processor.process_dataset(
-            abide_data,
-            window_len=window_length,
-            window_overlap=window_overlap,
-        )
+
+        if dataset_name == "abide":
+            if verbose:
+                print(f"Loading ABIDE dataset from {data_dir}...")
+
+            try:
+                from nilearn import datasets
+                abide_data = datasets.fetch_abide_pcp(
+                    data_dir=data_dir,
+                    derivatives="rois_cc200",
+                    n_subjects=n_subjects,
+                    verbose=1 if verbose else 0,
+                )
+            except Exception as e:
+                raise RuntimeError(f"Failed to load ABIDE dataset: {e}")
+
+            if verbose:
+                print("Processing ABIDE dataset into simplicial complexes (CPU preprocessing)...")
+
+            samples, labels, subject_ids = processor.process_dataset(
+                abide_data,
+                window_len=window_length,
+                window_overlap=window_overlap,
+            )
+        else:
+            if verbose:
+                print(f"Loading DEAP dataset from {data_dir}...")
+
+            deap_timeseries, deap_labels, deap_subject_ids, deap_metadata = load_deap_samples(
+                data_dir=data_dir,
+                n_subjects=n_subjects,
+                io_path=deap_io_path,
+                label_target=deap_label_target,
+                label_threshold=deap_label_threshold,
+                verbose=verbose,
+            )
+
+            if verbose:
+                print("Processing DEAP dataset into simplicial complexes (CPU preprocessing)...")
+
+            samples, labels, subject_ids = processor.process_samples(
+                timeseries_list=deap_timeseries,
+                labels=deap_labels,
+                subject_ids=deap_subject_ids,
+                window_len=window_length,
+                window_overlap=window_overlap,
+                desc="DEAP Samples",
+            )
+            loaded_metadata.update(deap_metadata)
     
     if not samples:
         raise RuntimeError("No samples were successfully processed")
@@ -1189,6 +1590,7 @@ def create_dataloaders(
     
     # Prepare metadata
     metadata = {
+        "dataset_name": dataset_name,
         "n_samples": len(dataset),
         "n_train": n_train,
         "n_val": n_val,
@@ -1212,6 +1614,7 @@ def create_dataloaders(
             metadata=metadata,
             output_dir=processed_output_dir,
             sindy_backend=sindy_backend,
+            dataset_name=dataset_name,
         )
         metadata["processed_export"] = export_info
         if verbose:
@@ -1224,6 +1627,7 @@ def create_dataloaders(
             "splits": str(processed_backend_dir / "splits.json"),
             "fast_cache": str(processed_backend_dir / FAST_CACHE_FILENAME),
             "num_subject_files": len(samples),
+            "dataset_name": dataset_name,
             "sindy_backend": _normalized_backend_name(sindy_backend),
         }
     

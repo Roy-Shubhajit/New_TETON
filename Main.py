@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Main training/evaluation orchestrator for ABIDE SINDy ML pipeline.
+Main training/evaluation orchestrator for simplicial SINDy ML pipeline.
 
 Loads configuration, creates dataloaders, trains model, and evaluates.
 """
@@ -152,6 +152,7 @@ class ModelTrainer:
         self.model.train()
         
         total_loss = 0.0
+        total_samples = 0
         all_preds = []
         all_labels = []
         pending_logits = []
@@ -164,6 +165,11 @@ class ModelTrainer:
             label = subject["label"].to(self.device).view(1)
 
             logits = self.model(subject["windows"])
+            
+            # Check for NaN/Inf in logits
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                self.logger.warning(f"NaN/Inf detected in logits at subject {subject_idx}")
+            
             pending_logits.append(logits)
             pending_labels.append(label)
 
@@ -175,13 +181,37 @@ class ModelTrainer:
                 batch_logits = torch.cat(pending_logits, dim=0)
                 batch_labels = torch.cat(pending_labels, dim=0)
                 loss = self.criterion(batch_logits, batch_labels)
+                
+                # Check for NaN/Inf in loss
+                if torch.isnan(loss) or torch.isinf(loss):
+                    self.logger.warning(f"NaN/Inf detected in loss. Skipping this batch.")
+                    pending_logits.clear()
+                    pending_labels.clear()
+                    self.optimizer.zero_grad(set_to_none=True)
+                    continue
 
                 loss.backward()
+                
+                # Check for NaN/Inf in gradients
+                has_nan_grad = False
+                for param in self.model.parameters():
+                    if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                        has_nan_grad = True
+                        break
+                
+                if has_nan_grad:
+                    self.logger.warning(f"NaN/Inf detected in gradients. Skipping update.")
+                    self.optimizer.zero_grad(set_to_none=True)
+                    pending_logits.clear()
+                    pending_labels.clear()
+                    continue
+                
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
 
                 total_loss += loss.item() * batch_labels.size(0)
+                total_samples += batch_labels.size(0)
                 pbar.set_postfix({"loss": loss.item(), "subjects": batch_labels.size(0)})
                 self.writer.add_scalar("Loss/train", loss.item(), self.global_step)
                 self.global_step += 1
@@ -190,8 +220,8 @@ class ModelTrainer:
                 pending_labels.clear()
         
         # Compute metrics
-        avg_loss = total_loss / len(train_loader)
-        accuracy = accuracy_score(all_labels, all_preds)
+        avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
+        accuracy = accuracy_score(all_labels, all_preds) if all_labels else 0.0
         
         metrics = {
             "loss": avg_loss,
@@ -326,13 +356,14 @@ class ModelTrainer:
         
         return metrics
     
-    def train(self, train_loader, val_loader) -> Dict[str, Any]:
+    def train(self, train_loader, val_loader, test_loader) -> Dict[str, Any]:
         """
         Complete training loop.
         
         Args:
             train_loader: Training dataloader
             val_loader: Validation dataloader
+            test_loader: Test dataloader
         
         Returns:
             Dictionary with training history
@@ -345,6 +376,11 @@ class ModelTrainer:
             "val_precision": [],
             "val_recall": [],
             "val_f1": [],
+            "test_loss": [],
+            "test_acc": [],
+            "test_precision": [],
+            "test_recall": [],
+            "test_f1": [],
         }
         
         self.logger.info(f"Starting training for {self.num_epochs} epochs...")
@@ -367,15 +403,28 @@ class ModelTrainer:
             history["val_recall"].append(val_metrics["recall"])
             history["val_f1"].append(val_metrics["f1"])
             
+            # Test
+            test_metrics = self.test(test_loader)
+            history["test_loss"].append(test_metrics["loss"])
+            history["test_acc"].append(test_metrics["accuracy"])
+            history["test_precision"].append(test_metrics["precision"])
+            history["test_recall"].append(test_metrics["recall"])
+            history["test_f1"].append(test_metrics["f1"])
+            
             # Log to tensorboard
             self.writer.add_scalars(
                 "Loss",
-                {"train": train_metrics["loss"], "val": val_metrics["loss"]},
+                {"train": train_metrics["loss"], "val": val_metrics["loss"], "test": test_metrics["loss"]},
                 epoch
             )
             self.writer.add_scalars(
                 "Accuracy",
-                {"train": train_metrics["accuracy"], "val": val_metrics["accuracy"]},
+                {"train": train_metrics["accuracy"], "val": val_metrics["accuracy"], "test": test_metrics["accuracy"]},
+                epoch
+            )
+            self.writer.add_scalars(
+                "F1",
+                {"train": 0.0, "val": val_metrics["f1"], "test": test_metrics["f1"]},
                 epoch
             )
             
@@ -392,7 +441,7 @@ def main():
     
     # Parse arguments
     parser = argparse.ArgumentParser(
-        description="Train and evaluate ABIDE SINDy ML model"
+        description="Train and evaluate SINDy simplicial ML model"
     )
     parser.add_argument(
         "--config",
@@ -417,10 +466,23 @@ def main():
         help="Model architecture to use"
     )
     parser.add_argument(
+        "--dataset",
+        type=str,
+        default="abide",
+        choices=["abide", "deap"],
+        help="Dataset to use"
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help="Root path for selected dataset"
+    )
+    parser.add_argument(
         "--n-subjects",
         type=int,
         default=None,
-        help="Number of subjects to use (None for all)"
+        help="Max number of subjects/samples to use (None for all)"
     )
     parser.add_argument(
         "--batch-size",
@@ -452,6 +514,25 @@ def main():
         help="Random seed"
     )
     parser.add_argument(
+        "--deap-io-path",
+        type=str,
+        default=None,
+        help="Optional TorchEEG cache path for DEAP"
+    )
+    parser.add_argument(
+        "--deap-label-target",
+        type=str,
+        default="valence",
+        choices=["valence", "arousal", "dominance", "liking"],
+        help="DEAP score dimension to binarize"
+    )
+    parser.add_argument(
+        "--deap-label-threshold",
+        type=float,
+        default=5.0,
+        help="Threshold used to create binary DEAP labels"
+    )
+    parser.add_argument(
         "--sindy-backend",
         type=str,
         default="faster_sindy",
@@ -470,6 +551,15 @@ def main():
         print("Using default configuration")
     
     # Override config with command-line arguments
+    config.config.setdefault("dataset", {})
+    config.config.setdefault("processing", {})
+    config.config.setdefault("training", {})
+    config.config.setdefault("model", {})
+
+    if args.dataset:
+        config.config["dataset"]["name"] = args.dataset
+    if args.data_dir:
+        config.config["dataset"]["data_dir"] = args.data_dir
     if args.model:
         config.config["model"]["name"] = args.model
     if args.n_subjects:
@@ -482,6 +572,11 @@ def main():
         config.config["training"]["learning_rate"] = args.lr
     if args.sindy_backend:
         config.config.setdefault("processing", {})["sindy_backend"] = args.sindy_backend
+    if args.deap_io_path:
+        config.config["dataset"]["deap_io_path"] = args.deap_io_path
+    if args.deap_label_target:
+        config.config["dataset"]["deap_label_target"] = args.deap_label_target
+    config.config["dataset"]["deap_label_threshold"] = float(args.deap_label_threshold)
     
     config.config["training"]["random_seed"] = args.seed
     
@@ -499,7 +594,7 @@ def main():
     writer = SummaryWriter(str(tb_dir))
     
     logger.info("="*60)
-    logger.info("ABIDE SINDy ML Pipeline")
+    logger.info("SINDy Simplicial ML Pipeline")
     logger.info("="*60)
     
     # Setup device for ML pipeline (prefer GPU when available).
@@ -513,14 +608,34 @@ def main():
     try:
         # Create dataloaders
         logger.info("Creating dataloaders...")
-        upsample_factor = config.get("processing.upsample_factor", 100)
-        window_length = int(
-            config.get("processing.window_length_base", 10) *
-            upsample_factor
+        dataset_name = str(config.get("dataset.name", "abide")).lower()
+        upsample_factor_raw = config.get("processing.upsample_factor", 1)
+        upsample_factor = int(upsample_factor_raw) if upsample_factor_raw is not None else 1
+        if upsample_factor < 1:
+            upsample_factor = 1
+        window_length_base = int(config.get("processing.window_length_base", 1024))
+        window_length = int(window_length_base * upsample_factor) if upsample_factor > 1 else window_length_base
+        default_data_dir = "./ABIDE_pcp" if dataset_name == "abide" else "./deap-dataset/data_preprocessed_python"
+        data_dir = config.get("dataset.data_dir", default_data_dir)
+        default_processed_dir = "./abide_simplicial_dataset" if dataset_name == "abide" else "./deap_simplicial_dataset"
+        processed_output_dir = config.get("dataset.processed_output_dir", default_processed_dir)
+        logger.info(
+            f"Dataset: {dataset_name} | data_dir: {data_dir} | "
+            f"upsample_factor: {upsample_factor} | window_length: {window_length}"
+        )
+        logger.info(
+            f"Window config -> base: {window_length_base}, effective: {window_length}, "
+            f"overlap: {config.get('processing.window_overlap', 0.25)}"
+        )
+        print(
+            f"window_length={window_length} "
+            f"(base={window_length_base}, overlap={config.get('processing.window_overlap', 0.25)}, "
+            f"upsample_factor={upsample_factor})"
         )
         
         train_loader, val_loader, test_loader, metadata = create_dataloaders(
-            data_dir="/hdfs1/Data/Shubhajit/Project/New_TETON",
+            data_dir=data_dir,
+            dataset_name=dataset_name,
             n_subjects=config.get("dataset.n_subjects"),
             window_length=window_length,
             window_overlap=config.get("processing.window_overlap", 0.25),
@@ -530,8 +645,12 @@ def main():
             test_split=config.get("training.test_split", 0.15),
             random_seed=args.seed,
             verbose=config.get("logging.verbose", True),
+            processed_output_dir=processed_output_dir,
             upsample_factor=upsample_factor,
             sindy_backend=config.get("processing.sindy_backend", "faster_sindy"),
+            deap_io_path=config.get("dataset.deap_io_path", None),
+            deap_label_target=config.get("dataset.deap_label_target", "valence"),
+            deap_label_threshold=config.get("dataset.deap_label_threshold", 5.0),
         )
         
         logger.info(f"Metadata: {_compact_metadata_for_log(metadata)}")
@@ -560,11 +679,16 @@ def main():
         
         # Train
         logger.info("Starting training...")
-        history = trainer.train(train_loader, val_loader)
+        history = trainer.train(train_loader, val_loader, test_loader)
         
-        # Test
-        logger.info("Starting testing...")
-        test_results = trainer.test(test_loader)
+        # Get final test results from last epoch
+        test_results = {
+            "loss": history["test_loss"][-1] if history["test_loss"] else 0.0,
+            "accuracy": history["test_acc"][-1] if history["test_acc"] else 0.0,
+            "precision": history["test_precision"][-1] if history["test_precision"] else 0.0,
+            "recall": history["test_recall"][-1] if history["test_recall"] else 0.0,
+            "f1": history["test_f1"][-1] if history["test_f1"] else 0.0,
+        }
         
         # Save results
         checkpoint_dir = Path(config.get("logging.checkpoint_dir", "./checkpoints"))
