@@ -226,10 +226,10 @@ def build_seed_graphs(
     return graphs
 
 
-def normalize_graph_features(train_ds: List[Data], val_ds: List[Data], test_ds: List[Data]) -> None:
+def normalize_graph_features(train_ds: List[Any], val_ds: List[Any], test_ds: List[Any]) -> None:
     train_x = torch.cat([d.x for d in train_ds], dim=0)
-    mu = train_x.mean(dim=0, keepdim=True)
-    sigma = train_x.std(dim=0, keepdim=True).clamp_min(1e-6)
+    mu = train_x.mean(dim=0, keepdim=True) if train_x.size(0) > 0 else torch.zeros(1)
+    sigma = train_x.std(dim=0, keepdim=True).nan_to_num(1.0).clamp_min(1e-6) if train_x.size(0) > 1 else torch.ones(1)
     for ds in (train_ds, val_ds, test_ds):
         for d in ds:
             d.x = (d.x - mu) / sigma
@@ -341,6 +341,8 @@ def train_once(
                 y = batch.y.view(-1).long()
                 loss = criterion(logits, y)
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
@@ -402,6 +404,8 @@ def parse_args():
 
 
 def main():
+    import torch.multiprocessing
+    torch.multiprocessing.set_sharing_strategy('file_system')
     args = parse_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)

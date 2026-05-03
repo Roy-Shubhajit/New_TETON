@@ -321,6 +321,18 @@ class TemporalSCCN_approach2(_TemporalSCCNBase):
         #print(len(windows))
         for window_idx, window in windows.items():
             #print(window.keys())
+
+            #check if .numel() is 0
+            for key in ["features", "incidences", "adjacencies"]:
+                if key not in window:
+                    raise ValueError(f"Window {window_idx} missing '{key}' key")
+                if not isinstance(window[key], dict):
+                    raise ValueError(f"Window {window_idx} '{key}' is not a dict")
+                for subkey, value in window[key].items():
+                    if isinstance(value, torch.Tensor) and value.numel() == 0:
+                        raise ValueError(f"Window {window_idx} '{key}' subkey '{subkey}' has empty tensor")
+                    if isinstance(value, np.ndarray) and value.size == 0:
+                        raise ValueError(f"Window {window_idx} '{key}' subkey '{subkey}' has empty array") 
             x_dict = _rectify_rank_mapping(window["features"], device)
             incidences = _rectify_rank_mapping(window["incidences"], device)
             adjacencies = _rectify_rank_mapping(window["adjacencies"], device)
@@ -334,19 +346,63 @@ class TemporalSCCN_approach2(_TemporalSCCNBase):
             #for key in adjacencies.keys():
                # print(f"  {key} shape: {adjacencies[key].shape}, dtype: {adjacencies[key].dtype}")
 
-            # Apply input projections manually for approach2 since it interleaves layers differently
-            rank_0 = x_dict.get("rank_0", torch.empty((0, self.in_channel), device=device))
-            rank_1 = x_dict.get("rank_1", torch.empty((0, self.in_channel), device=device))
-            rank_2 = x_dict.get("rank_2", torch.empty((0, self.in_channel), device=device))
+            #check if all matrices are not nan
             
+
+            # Apply input projections manually for approach2 since it interleaves layers differently
+            #rank_0 = x_dict.get("rank_0", torch.empty((0, self.in_channel), device=device))
+            #rank_1 = x_dict.get("rank_1", torch.empty((0, self.in_channel), device=device))
+            #rank_2 = x_dict.get("rank_2", torch.empty((0, self.in_channel), device=device))
+            
+            #x_dict = {
+             #   "rank_0": self.proj_0(rank_0) if rank_0.numel() > 0 else torch.empty((0, self.hidden_channels), device=device),
+              #  "rank_1": self.proj_1(rank_1) if rank_1.numel() > 0 else torch.empty((0, self.hidden_channels), device=device),
+               # "rank_2": self.proj_2(rank_2) if rank_2.numel() > 0 else torch.empty((0, self.hidden_channels), device=device),
+            #}
             x_dict = {
-                "rank_0": self.proj_0(rank_0) if rank_0.numel() > 0 else torch.empty((0, self.hidden_channels), device=device),
-                "rank_1": self.proj_1(rank_1) if rank_1.numel() > 0 else torch.empty((0, self.hidden_channels), device=device),
-                "rank_2": self.proj_2(rank_2) if rank_2.numel() > 0 else torch.empty((0, self.hidden_channels), device=device),
+                "rank_0": self.proj_0(x_dict["rank_0"]),
+                "rank_1": self.proj_1(x_dict["rank_1"]),
+                "rank_2": self.proj_2(x_dict["rank_2"]),
             }
+
+            for key, mat in x_dict.items():
+                if not torch.isfinite(mat).all():
+                    raise ValueError(f"Non-finite values found in features for {key} at window {window_idx}")
+            for key, mat in incidences.items():
+                if not torch.isfinite(mat).all():
+                    raise ValueError(f"Non-finite values found in incidences for {key} at window {window_idx}")
+            for key, mat in adjacencies.items():
+                if not torch.isfinite(mat).all():
+                    raise ValueError(f"Non-finite values found in adjacencies for {key} at window {window_idx}")
+
+            for key, mat in x_dict.items():
+                if mat.numel() == 0:
+                    raise ValueError(f"Empty tensor found in features for {key} at window {window_idx}")
+            for key, mat in incidences.items():
+                if mat.numel() == 0:
+                    raise ValueError(f"Empty tensor found in incidences for {key} at window {window_idx}")
+            for key, mat in adjacencies.items():
+                if mat.numel() == 0:
+                    raise ValueError(f"Empty tensor found in adjacencies for {key} at window {window_idx}")
+                
+            #print(f"X_dict keys: {list(x_dict.keys())}")
+            #for key in x_dict.keys():
+            #    print(f"  {key} shape: {x_dict[key].shape}, dtype: {x_dict[key].dtype}")
+            #print(f"Incidences keys: {list(incidences.keys())}")
+            #for key in incidences.keys():
+            #    print(f"  {key} shape: {incidences[key].shape}, dtype: {incidences[key].dtype}")
+            #print(f"Adjacencies keys: {list(adjacencies.keys())}")
+            #for key in adjacencies.keys():
+            #    print(f"  {key} shape: {adjacencies[key].shape}, dtype: {adjacencies[key].dtype}")
+                
 
             for layer_idx in range(self.n_layers):
                 x_dict = self.conv_layers[layer_idx](x_dict, incidences, adjacencies)
+                for key, mat in x_dict.items():
+                    if not torch.isfinite(mat).all():
+                        raise ValueError(
+                            f"Non-finite values introduced by SCCN layer {layer_idx} for {key} at window {window_idx}"
+                        )
                 if x_dict["rank_0"].shape[0] > 0:
                     z_0 = x_dict["rank_0"].mean(dim=0, keepdim=True)
                 else:

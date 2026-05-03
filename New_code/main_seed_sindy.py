@@ -22,7 +22,6 @@ try:
 except Exception:
     SEED_ADJACENCY_MATRIX = None
 
-
 SEED_VII_ROOT = "/hdfs1/Data/Shubhajit/Project/New_TETON/New_code/SEED-VII"
 EEG_PREPROCESSED_DIR = Path(SEED_VII_ROOT) / "EEG_preprocessed"
 EMOTION_LABEL_FILE = Path(SEED_VII_ROOT) / "emotion_label_and_stimuli_order.xlsx"
@@ -470,21 +469,13 @@ def build_simplicies(
 
 
 def normalize_simplicies_features(train_ds: List[Any], val_ds: List[Any], test_ds: List[Any]) -> None:
-    all_x0 = torch.cat([torch.tensor(d.windows[w]["features"][0]) for d in train_ds for w in d.windows], dim=0)
-    all_x1 = torch.cat([torch.tensor(d.windows[w]["features"][1]) for d in train_ds for w in d.windows], dim=0)
-    all_x2 = torch.cat([torch.tensor(d.windows[w]["features"][2]) for d in train_ds for w in d.windows], dim=0)
-    mu0 = all_x0.mean(dim=0, keepdim=True)
-    sigma0 = all_x0.std(dim=0, keepdim=True).clamp_min(1e-6)
-    mu1 = all_x1.mean(dim=0, keepdim=True)
-    sigma1 = all_x1.std(dim=0, keepdim=True).clamp_min(1e-6)
-    mu2 = all_x2.mean(dim=0, keepdim=True)
-    sigma2 = all_x2.std(dim=0, keepdim=True).clamp_min(1e-6)
-    for ds in (train_ds, val_ds, test_ds):
-        for d in ds:
-            for w in d.windows:
-                d.windows[w]["features"][0] = (torch.tensor(d.windows[w]["features"][0]) - mu0) / sigma0
-                d.windows[w]["features"][1] = (torch.tensor(d.windows[w]["features"][1]) - mu1) / sigma1
-                d.windows[w]["features"][2] = (torch.tensor(d.windows[w]["features"][2]) - mu2) / sigma2
+    #use torch.nn.functional.normalize to normalize the features in train_ds, val_ds and test_ds
+    for ds in [train_ds, val_ds, test_ds]:
+        for sample in ds:
+            for w_idx, window in sample.windows.items():
+                features = window["features"]
+                for rank, feat in features.items():
+                    window["features"][rank] = torch.nn.functional.normalize(torch.tensor(feat, dtype=torch.float32), p=1)
 
 
 def make_model(
@@ -508,14 +499,14 @@ def make_model(
 @torch.no_grad()
 def evaluate(model: torch.nn.Module, loader: DataLoader, criterion: torch.nn.Module, device: torch.device):
     model.eval()
-    use_amp = device.type == "cuda"
+    use_amp = False
     total_loss, total_correct, total, n_batches = 0.0, 0, 0, 0
     pbar = tqdm(loader, desc="Evaluating")
     for sample in pbar:
         label = sample["label"].to(device).view(-1)
-        with torch.amp.autocast(enabled=use_amp, device_type='cuda'):
-            logits = model(sample["windows"])
-            loss = criterion(logits, label)
+        #with torch.amp.autocast(enabled=use_amp, device_type='cuda'):
+        logits = model(sample["windows"])
+        loss = criterion(logits, label)
         pred = logits.argmax(dim=1)
         total_correct += int((pred == label).sum().item())
         total += label.numel()
@@ -544,8 +535,8 @@ def train_once(
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=20)
-    use_amp = device.type == "cuda"
-    scaler = torch.amp.GradScaler(enabled=use_amp)
+    use_amp = False
+    #scaler = torch.amp.GradScaler(enabled=use_amp)
 
     best_val, best_state, stale = -1.0, None, 0
     for epoch in range(epochs + 1):
@@ -561,6 +552,7 @@ def train_once(
             optimizer.zero_grad()
             with torch.amp.autocast(enabled=use_amp, device_type='cuda'):
                 logits = model(sample["windows"])
+                #check if logits contain NaN or Inf values
                 pending_logits.append(logits)
                 pending_labels.append(label)
             
@@ -576,9 +568,16 @@ def train_once(
 
                 loss = criterion(batch_logits.float(), batch_labels)
 
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+                #scaler.scale(loss).backward()
+                #scaler.unscale_(optimizer)
+                #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                #scaler.step(optimizer)
+                #scaler.update()
+
+                loss.backward()
+                optimizer.step()
+
+                print("Batch loss: {:.4f}".format(loss.item()))
 
                 total_loss += loss.item()
                 total_correct += int((batch_logits.argmax(dim=1) == batch_labels).sum().item())
@@ -598,11 +597,12 @@ def train_once(
         else:
             stale += 1
 
-        if epoch % 25 == 0:
-            print(
+        print(
                 f"Epoch {epoch:>4} | train_loss {tr_loss:.4f} | train_acc {tr_acc*100:5.2f}% "
                 f"| val_loss {val_loss:.4f} | val_acc {val_acc*100:5.2f}%"
             )
+        
+
         if stale >= patience:
             print(f"Early stop at epoch {epoch}, no val improvement for {patience} epochs.")
             break
@@ -616,8 +616,8 @@ def train_once(
 def parse_args():
     p = argparse.ArgumentParser(description="SEED-VII GCN/GIN with KNN graph + Optuna tuning")
     p.add_argument("--epochs", type=int, default=1000)
-    p.add_argument("--batch_size", type=int, default=32, help="Gradient accumulation steps for one-subject batches.")
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--batch_size", type=int, default=128, help="Gradient accumulation steps for one-subject batches.")
+    p.add_argument("--lr", type=float, default=3e-3)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--hidden", type=int, default=512)
     p.add_argument("--num_layers", type=int, default=3)
@@ -649,6 +649,9 @@ def parse_args():
 
 
 def main():
+    import torch.multiprocessing
+    torch.multiprocessing.set_sharing_strategy('file_system')
+
     args = parse_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -704,6 +707,7 @@ def main():
 
     use_cuda = torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
+    #device = torch.device("cpu")
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         print(f"Using GPU: {torch.cuda.get_device_name(0)}")
@@ -775,6 +779,7 @@ def main():
         model, train_loader, val_loader, test_loader, device, args.epochs, args.lr, args.weight_decay, args.patience, args
     )
     print(f"Best Val Acc: {best_val*100:.2f}% | Test Loss: {test_loss:.4f} | Test Acc: {test_acc*100:.2f}%")
+
 
 
 if __name__ == "__main__":
