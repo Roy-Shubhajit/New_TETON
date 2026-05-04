@@ -16,9 +16,9 @@ from scipy.signal import welch
 from sklearn.model_selection import train_test_split
 from torch.nn import BatchNorm1d, Linear, ReLU, Sequential
 from torch_geometric.data import Data
-from torch_geometric.loader import DataLoader
+from torch.utils.data import DataLoader
 from torch_geometric.nn import GCNConv, GINConv, global_add_pool, global_mean_pool, global_max_pool
-from topomodelx.nn.simplicial import sccn_layer
+from topomodelx.nn.simplicial.sccn_layer import SCCNLayer
 try:
     from torcheeg.datasets.constants import SEED_ADJACENCY_MATRIX
 except Exception:
@@ -32,6 +32,12 @@ CACHE_DIR = Path(__file__).resolve().parent / ".cache"
 
 FS = 200
 BANDS: Tuple[Tuple[int, int], ...] = ((1, 4), (4, 8), (8, 14), (14, 31), (31, 50))
+
+
+#define a collater function which just returns the batch as is as batch size is 1
+def collate_fn(batch):
+    return batch[0]
+
 
 class complexes:
     def __init__(self, feature, adjacency, incidence, y, trial):
@@ -228,7 +234,7 @@ def construct_topological_snapshot(
     A1 = (B1.T @ B1 + B2 @ B2.T).astype(np.float32)
     A2 = (B2.T @ B2).astype(np.float32)
 
-    features = {0: x0, 1: x1, 2: x2}
+    features = {"rank_0": x0, "rank_1": x1, "rank_2": x2}
     incidences = {
         "rank_1": B1,
         "rank_2": B2,
@@ -404,7 +410,7 @@ def build_simplicies(
                     results = run_sindy_windows(
                         X_raw = w,
                         window_size = len(w),
-                        stride = window_size,
+                        stride = len(w),
                         preprocess_cfg = preprocess_cfg,
                         selection_cfg = selection_cfg,
                         solver_cfg = solver_cfg,
@@ -415,7 +421,7 @@ def build_simplicies(
 
                 y = labels_80[trial_id - 1]
                 features, incidences, adjacencies, _, _ = construct_topological_snapshot(
-                    node_features=w,
+                    node_features=x,
                     edge_list=pred_edges,
                     triangle_list=pred_tris,
                     agg_func="mean",
@@ -432,7 +438,7 @@ def build_simplicies(
                 )
 
     if not simplices:
-        raise ValueError("No graphs were created. Try smaller --window_sec or lower --max_subjects debug settings.")
+        raise ValueError("No simplices were created. Try smaller --window_sec or lower --  debug settings.")
 
     if use_cache:
         try:
@@ -460,7 +466,7 @@ def normalize_simplicial_features(train_ds: List[Any], val_ds: List[Any], test_d
                 x = torch.tensor(d.feature[key], dtype=torch.float32)
                 mu = x.mean(dim=0, keepdim=True) if x.size(0) > 0 else torch.zeros(1)
                 sigma = x.std(dim=0, keepdim=True).nan_to_num(1.0).clamp_min(1e-6) if x.size(0) > 1 else torch.ones(1)
-                d.feature[key] = ((x - mu) / sigma).numpy()
+                d.feature[key] = (x - mu) / sigma
 
 
 class GCN(torch.nn.Module):
@@ -519,14 +525,33 @@ class SCCN(torch.nn.Module):
         self.proj2 = Linear(in_features, hidden)
         self.convs = torch.nn.ModuleList()
         for _ in range(num_layers):
-            self.convs.append(sccn_layer(channels = hidden, max_rank=2, aggr_func="mean", update_func="relu"))
+            self.convs.append(SCCNLayer(channels = hidden, max_rank=2, aggr_func="mean", update_func="relu"))
         self.lin = Linear(hidden * 3, num_classes)
         self.dropout = dropout
 
     def forward(self, data: complexes):
-        h0 = data.feature[0]
-        h1 = data.feature[1]
-        h2 = data.feature[2]
+    
+        #make sure all matrices are in gpu
+        device = next(self.parameters()).device
+        
+        # Convert adjacency matrices to tensors on device
+        adjacency_tensors = {}
+        for key in data.adjacency.keys():
+            adjacency_tensors[key] = torch.tensor(data.adjacency[key], dtype=torch.float32, device=device)
+        
+        # Convert incidence matrices to tensors on device
+        incidence_tensors = {}
+        for key in data.incidence.keys():
+            incidence_tensors[key] = torch.tensor(data.incidence[key], dtype=torch.float32, device=device)
+        
+        # Convert features to tensors on device
+        feature_tensors = {}
+        for key in data.feature.keys():
+            feature_tensors[key] = torch.tensor(data.feature[key], dtype=torch.float32, device=device)
+
+        h0 = feature_tensors["rank_0"]
+        h1 = feature_tensors["rank_1"]
+        h2 = feature_tensors["rank_2"]
 
         h0 = self.proj0(h0)
         h1 = self.proj1(h1)
@@ -534,9 +559,44 @@ class SCCN(torch.nn.Module):
 
         features = {"rank_0": h0, "rank_1": h1, "rank_2": h2}
 
+        # Normalize types to torch.Tensor on device and avoid empty-tensor mean producing NaNs.
+        for k in list(adjacency_tensors.keys()):
+            val = adjacency_tensors[k]
+            if not isinstance(val, torch.Tensor):
+                adjacency_tensors[k] = torch.tensor(val, dtype=torch.float32, device=device)
+            else:
+                adjacency_tensors[k] = val.to(device)
+
+        for k in list(incidence_tensors.keys()):
+            val = incidence_tensors[k]
+            if not isinstance(val, torch.Tensor):
+                incidence_tensors[k] = torch.tensor(val, dtype=torch.float32, device=device)
+            else:
+                incidence_tensors[k] = val.to(device)
+
+        for k in list(features.keys()):
+            val = features[k]
+            if not isinstance(val, torch.Tensor):
+                features[k] = torch.tensor(val, dtype=torch.float32, device=device)
+            else:
+                features[k] = val.to(device)
+            if features[k].dim() == 1:
+                features[k] = features[k].unsqueeze(-1)
+
+        def _safe_mean(tensor: torch.Tensor) -> torch.Tensor:
+            if tensor.numel() == 0:
+                feat_dim = tensor.size(1) if tensor.dim() >= 2 else self.proj0.out_features
+                return torch.zeros((1, feat_dim), dtype=torch.float32, device=device)
+            return torch.mean(tensor, dim=0, keepdim=True)
+
         for conv in self.convs:
-            features = conv(features, data.adjacency, data.incidence)
-        global_feature = torch.cat([torch.mean(features["rank_0"], dim=0, keepdim=True), torch.mean(features["rank_1"], dim=0, keepdim=True), torch.mean(features["rank_2"], dim=0, keepdim=True)], dim=1)
+            features = conv(features=features, incidences=incidence_tensors, adjacencies=adjacency_tensors)
+
+        global_feature = torch.cat([
+            _safe_mean(features["rank_0"]),
+            _safe_mean(features["rank_1"]),
+            _safe_mean(features["rank_2"]),
+        ], dim=1)
 
         global_feature = F.dropout(global_feature, p=self.dropout, training=self.training)
         return self.lin(global_feature)
@@ -644,8 +704,8 @@ def train_once(
         else:
             stale += 1
 
-        if epoch % 25 == 0:
-            print(
+
+        print(
                 f"Epoch {epoch:>4} | train_loss {tr_loss:.4f} | train_acc {tr_acc*100:5.2f}% "
                 f"| val_loss {val_loss:.4f} | val_acc {val_acc*100:5.2f}%"
             )
@@ -728,7 +788,7 @@ def main():
         use_cache=not args.no_cache,
         args=args
     )
-    print(f"Graphs: {len(dataset)}")
+    print(f"Simplicies: {len(dataset)}")
 
     y_all = [int(d.y.item()) for d in dataset]
     idx = np.arange(len(dataset))
@@ -738,7 +798,7 @@ def main():
     train_ds = [dataset[i] for i in train_idx]
     val_ds = [dataset[i] for i in val_idx]
     test_ds = [dataset[i] for i in test_idx]
-    normalize_graph_features(train_ds, val_ds, test_ds)
+    #normalize_simplicial_features(train_ds, val_ds, test_ds)
 
     use_cuda = torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
@@ -753,7 +813,7 @@ def main():
     if num_workers > 0:
         loader_kwargs["prefetch_factor"] = 4
 
-    in_features = train_ds[0].num_node_features
+    in_features = train_ds[0].feature["rank_0"].shape[1]
     n_classes = len(emo_map)
 
     if args.use_optuna:
@@ -778,7 +838,7 @@ def main():
             te_loader = DataLoader(test_ds, batch_size=bs, shuffle=False, **loader_kwargs)
 
             model = make_model(model_name, in_features, n_classes, hidden, dropout, num_layers).to(device)
-            val_acc, _, _ = train_once(model, tr_loader, va_loader, te_loader, device, args.optuna_epochs, lr, wd, 40)
+            val_acc, _, _ = train_once(model, tr_loader, va_loader, te_loader, device, args.optuna_epochs, lr, wd, 40, args=args)
             return val_acc
 
         study = optuna.create_study(direction="maximize")
@@ -793,9 +853,9 @@ def main():
         args.weight_decay = float(bp["weight_decay"])
         args.batch_size = int(bp["batch_size"])
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, **loader_kwargs)
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, **loader_kwargs)
+    train_loader = DataLoader(train_ds, batch_size=1, shuffle=True, collate_fn=collate_fn, **loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=collate_fn, **loader_kwargs)
+    test_loader = DataLoader(test_ds, batch_size=1, shuffle=False, collate_fn=collate_fn, **loader_kwargs)
 
     model = make_model(args.model, in_features, n_classes, args.hidden, args.dropout, args.num_layers).to(device)
     print(
@@ -804,7 +864,7 @@ def main():
         f"lr={args.lr:.2e}, wd={args.weight_decay:.2e}"
     )
     best_val, test_loss, test_acc = train_once(
-        model, train_loader, val_loader, test_loader, device, args.epochs, args.lr, args.weight_decay, args.patience
+        model, train_loader, val_loader, test_loader, device, args.epochs, args.lr, args.weight_decay, args.patience, args
     )
     print(f"Best Val Acc: {best_val*100:.2f}% | Test Loss: {test_loss:.4f} | Test Acc: {test_acc*100:.2f}%")
 
